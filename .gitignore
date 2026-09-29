@@ -1,0 +1,14 @@
+# Segredos e estado local — nunca fazer commit
+.env
+zec_state.json
+zec_state.bak
+zec_state.tmp
+zec_bot.log
+zec_backtest_trades.csv
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
