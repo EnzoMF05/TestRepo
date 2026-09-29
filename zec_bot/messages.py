@@ -28,7 +28,37 @@ def position_size(cfg: Config, entry: float, risk: float) -> tuple[float, float,
     return qty, notional, notional / cfg.account_size
 
 
-def format_signal(t: Trade, cfg: Config, htf: int, rsi: float, adx: float) -> str:
+def _usd(x: float) -> str:
+    return f"{x / 1e6:.2f}M$" if x >= 1e6 else f"{x / 1e3:.0f}k$"
+
+
+def _signed(x: float | None, unit: str = "%") -> str:
+    return "n/d" if x is None or x != x else f"{x:+.2f}{unit}"
+
+
+def derivs_lines(deriv: dict | None, side: str, cfg: Config) -> str:
+    """Linhas de contexto de funding/OI (vazio se não houver dados)."""
+    if not deriv:
+        return ""
+    f8 = deriv["funding_8h_pct"]
+    pays = "longs pagam" if f8 > 0 else "shorts pagam" if f8 < 0 else "neutro"
+    src = {"hl": "", "coinalyze": " (Coinalyze)"}.get(deriv.get("oi_source"), "")
+    lines = [
+        f"Funding: <b>{f8:+.4f}%/8h</b> ({pays}) · prémio {deriv['premium_pct']:+.3f}%",
+        f"OI: <b>{_usd(deriv['oi_usd'])}</b> · 1h {_signed(deriv.get('oi_change_1h_pct'))} · "
+        f"4h {_signed(deriv.get('oi_change_4h_pct'))}{src}",
+    ]
+    if deriv.get("reading"):
+        lines.append(f"Leitura: {deriv['reading']}")
+    lim = cfg.funding_limit_8h_pct
+    if side == "long" and f8 > lim:
+        lines.append(f"⚠️ Funding elevado ({f8:+.3f}%/8h): longs sobrelotados, cuidado com squeeze contra ti.")
+    if side == "short" and f8 < -lim:
+        lines.append(f"⚠️ Funding muito negativo ({f8:+.3f}%/8h): shorts sobrelotados, cuidado com squeeze contra ti.")
+    return "\n".join(lines) + "\n"
+
+
+def format_signal(t: Trade, cfg: Config, htf: int, rsi: float, adx: float, deriv: dict | None = None) -> str:
     long_ = t.side == "long"
     icon, word = ("🟢", "LONG") if long_ else ("🔴", "SHORT")
     kind = "Pullback" if t.kind == "pullback" else "Rutura (breakout)"
@@ -47,9 +77,18 @@ def format_signal(t: Trade, cfg: Config, htf: int, rsi: float, adx: float) -> st
         f"TP2: <b>{_px(t.tp2)}</b> ({rr2:.1f}R)\n\n"
         f"Tamanho (risco {cfg.risk_pct:g}% de {cfg.account_size:,.0f}$): "
         f"{qty:.2f} {cfg.base} ≈ {notional:,.0f}$ (~{lev:.1f}x)\n"
+        f"{_leverage_warning(lev, deriv)}"
         f"Contexto: 1h em {trend} · ADX {adx:.0f} · RSI {rsi:.0f}\n"
+        f"{derivs_lines(deriv, t.side, cfg)}"
         f"Não entrar se o preço já passou {_px(chase)}. Saída a mercado após {cfg.max_hold_bars * cfg.interval_min // 60}h."
     )
+
+
+def _leverage_warning(lev: float, deriv: dict | None) -> str:
+    mx = (deriv or {}).get("max_leverage") or 0.0
+    if mx and lev > mx:
+        return f"⚠️ Esse tamanho exige {lev:.1f}x, acima do máximo de {mx:.0f}x do ZEC na Hyperliquid: reduz o tamanho.\n"
+    return ""
 
 
 def format_event(ev: Event, cfg: Config) -> str | None:
@@ -63,6 +102,9 @@ def format_event(ev: Event, cfg: Config) -> str | None:
         icon = "✅" if t.r_net > 0 else "❌"
         return (f"{icon} <b>{cfg.base} {t.side.upper()}</b> — {why}\n"
                 f"Resultado: <b>{t.r_net:+.2f}R</b> (já com comissões/derrapagem)")
+    if ev.kind == "blocked":
+        d = ev.data
+        return f"🚫 Setup {d['side'].upper()} ({d['kind']}) ignorado pelos filtros: {d['reason']}"
     if ev.kind == "daily_stop":
         return (f"⛔ Limite diário atingido ({ev.data['day_r']:+.1f}R). "
                 f"Sem mais sinais até às 00:00 UTC.")
@@ -85,7 +127,7 @@ def format_stats(stats: dict, title: str) -> str:
             f"Total: <b>{stats['total_r']:+.2f}R</b> · média {stats['avg_r']:+.2f}R · profit factor {pf}")
 
 
-def format_status(engine, cfg: Config, last_price: float, exchange: str) -> str:
+def format_status(engine, cfg: Config, last_price: float, exchange: str, deriv: dict | None = None) -> str:
     t = engine.trade
     lines = [f"🤖 <b>{cfg.base} bot</b> — {'⏸ em pausa' if engine.paused else '▶️ ativo'}",
              f"Preço: {_px(last_price)} ({exchange})",
@@ -95,6 +137,9 @@ def format_status(engine, cfg: Config, last_price: float, exchange: str) -> str:
                      f"TP1 {_px(t.tp1)} · TP2 {_px(t.tp2)} ({t.state})")
     else:
         lines.append("Sem trade aberto.")
+    if deriv:
+        lines.append(f"Funding {deriv['funding_8h_pct']:+.4f}%/8h · OI {_usd(deriv['oi_usd'])} "
+                     f"(1h {_signed(deriv.get('oi_change_1h_pct'))})")
     return "\n".join(lines)
 
 

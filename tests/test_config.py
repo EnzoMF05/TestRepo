@@ -49,4 +49,15 @@ def test_invalid_side_is_rejected(tmp_path, monkeypatch, clean_env):
 def test_missing_dotenv_is_fine(tmp_path, monkeypatch, clean_env):
     monkeypatch.chdir(tmp_path)
     load_dotenv()
-    assert Config.from_env().exchange == "binance"
+    c = Config.from_env()
+    assert (c.exchange, c.allow_fallback, c.funding_filter, c.oi_filter) == ("hyperliquid", False, False, False)
+
+
+def test_derivs_options_parse(tmp_path, monkeypatch, clean_env):
+    (tmp_path / ".env").write_text("FUNDING_FILTER=true\nFUNDING_LIMIT_8H_PCT=0.03\nOI_FILTER=sim\n"
+                                   "OI_MIN_CHANGE_PCT=0.5\nOI_LOOKBACK_HOURS=2\nCOINALYZE_API_KEY=abc\nALLOW_FALLBACK=true\n")
+    monkeypatch.chdir(tmp_path)
+    c = Config.from_env()
+    assert (c.funding_filter, c.funding_limit_8h_pct, c.oi_filter, c.oi_min_change_pct, c.oi_lookback_hours) == (
+        True, 0.03, True, 0.5, 2.0)
+    assert (c.coinalyze_api_key, c.allow_fallback) == ("abc", True)

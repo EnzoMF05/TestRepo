@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from .config import Config
@@ -96,7 +97,7 @@ class Trade:
 
 @dataclass
 class Event:
-    kind: str  # signal | tp1 | closed | daily_stop | day_summary
+    kind: str  # signal | tp1 | closed | daily_stop | day_summary | blocked
     trade: Optional[Trade] = None
     data: dict = field(default_factory=dict)
 
@@ -153,9 +154,29 @@ class Engine:
     def _side_allowed(self, side: str) -> bool:
         return self.cfg.side == "both" or self.cfg.side == side
 
+    def _deriv_block(self, sig: Signal, deriv: Optional[dict]) -> Optional[str]:
+        """Motivo para bloquear o sinal por funding/OI (só com os filtros ligados). Sem dados: não bloqueia."""
+        c = self.cfg
+        if not deriv:
+            return None
+        f = deriv.get("funding_8h_pct")
+        if c.funding_filter and f is not None and not np.isnan(f):
+            if sig.side == "long" and f > c.funding_limit_8h_pct:
+                return f"funding {f:+.3f}%/8h > {c.funding_limit_8h_pct:g}% (longs sobrelotados)"
+            if sig.side == "short" and f < -c.funding_limit_8h_pct:
+                return f"funding {f:+.3f}%/8h < -{c.funding_limit_8h_pct:g}% (shorts sobrelotados)"
+        oi = deriv.get("oi_change_pct")
+        if c.oi_filter and sig.kind == "breakout" and oi is not None and not np.isnan(oi):
+            if oi < c.oi_min_change_pct:
+                return f"OI {oi:+.2f}% < {c.oi_min_change_pct:g}% (rutura sem posições novas)"
+        return None
+
     # ------------------------------------------------------------------ barra
-    def on_bar(self, feat: pd.DataFrame, i: int, evaluate: bool = True) -> list[Event]:
-        """Processa a barra fechada `i`. `evaluate=False` só atualiza o trade aberto (barras em atraso)."""
+    def on_bar(self, feat: pd.DataFrame, i: int, evaluate: bool = True, deriv: Optional[dict] = None) -> list[Event]:
+        """Processa a barra fechada `i`. `evaluate=False` só atualiza o trade aberto (barras em atraso).
+
+        `deriv`: contexto de funding/OI dessa barra (chaves `funding_8h_pct`, `oi_change_pct`), opcional.
+        """
         ts = feat.index[i]
         iso = ts.isoformat()
         events: list[Event] = []
@@ -186,7 +207,10 @@ class Engine:
 
         if evaluate and self._can_signal(ts):
             sig = signal_at(feat, i, self.p)
-            if sig is not None and self._side_allowed(sig.side):
+            reason = self._deriv_block(sig, deriv) if sig is not None and self._side_allowed(sig.side) else None
+            if reason:  # bloqueado: não conta para o cooldown nem para o limite diário
+                events.append(Event("blocked", data={"reason": reason, "side": sig.side, "kind": sig.kind, "time": iso}))
+            elif sig is not None and self._side_allowed(sig.side):
                 self.trade = self._open(sig, iso)
                 self.day_signals += 1
                 self.last_signal_time = iso

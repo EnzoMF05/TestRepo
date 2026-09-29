@@ -14,6 +14,7 @@ import pandas as pd
 from . import messages
 from .config import Config
 from .data import get_candles
+from .derivs import DerivsMonitor
 from .engine import Engine
 from .strategy import Params, prepare
 from .telegram import Telegram
@@ -32,14 +33,17 @@ class Bot:
         fetch: Callable[[], tuple[pd.DataFrame, str]] | None = None,
         tg: Telegram | None = None,
         now: Callable[[], pd.Timestamp] | None = None,
+        derivs: DerivsMonitor | None = None,
     ):
         self.cfg = cfg
         self.p = params or Params()
         self.engine = Engine(cfg, self.p)
         self.tg = tg or Telegram(cfg.telegram_token, cfg.telegram_chat_id)
         self.fetch = fetch or (
-            lambda: get_candles(cfg.exchange, cfg.base, cfg.quote, cfg.interval_min, self.p.warmup_bars + 50)
+            lambda: get_candles(cfg.exchange, cfg.base, cfg.quote, cfg.interval_min, self.p.warmup_bars + 50,
+                                allow_fallback=cfg.allow_fallback)
         )
+        self.derivs = derivs or DerivsMonitor(cfg)
         self.now = now or (lambda: pd.Timestamp.now(tz="UTC"))
         self.exchange = cfg.exchange
         self.last_price = 0.0
@@ -52,7 +56,9 @@ class Bot:
         path = Path(self.cfg.state_file)
         if path.exists():
             try:
-                self.engine.load(json.loads(path.read_text(encoding="utf-8")))
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                self.engine.load(saved)
+                self.derivs.samples = [list(map(float, x)) for x in saved.get("derivs_samples", [])]
                 log.info("Estado carregado de %s (%d trades no histórico)", path, len(self.engine.closed))
             except (ValueError, KeyError, TypeError) as e:
                 log.error("Ficheiro de estado inválido (%s) — a começar do zero. Cópia em .bak", e)
@@ -61,18 +67,20 @@ class Bot:
     def _save_state(self) -> None:
         path = Path(self.cfg.state_file)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.engine.to_dict()), encoding="utf-8")
+        state = self.engine.to_dict()
+        state["derivs_samples"] = self.derivs.samples  # histórico próprio de OI, sobrevive a reinícios
+        tmp.write_text(json.dumps(state), encoding="utf-8")
         os.replace(tmp, path)  # escrita atómica: nunca deixa o ficheiro a meio
 
     # ------------------------------------------------------------------ ciclo
-    def _dispatch(self, events) -> None:
+    def _dispatch(self, events, deriv: dict | None = None) -> None:
         for ev in events:
             text = (
-                messages.format_signal(ev.trade, self.cfg, **ev.data)
+                messages.format_signal(ev.trade, self.cfg, deriv=deriv, **ev.data)
                 if ev.kind == "signal"
                 else messages.format_event(ev, self.cfg)
             )
-            log.info("evento %s", ev.kind)
+            log.info("evento %s%s", ev.kind, f" ({ev.data['reason']})" if ev.kind == "blocked" else "")
             if text:
                 self.tg.send(text)
 
@@ -83,6 +91,7 @@ class Bot:
             return 0
         self.last_price = float(df["close"].iloc[-1])
         feat = prepare(df, self.p)
+        self.derivs.refresh()  # amostra o OI de 5 em 5 min (com cache), mesmo sem barras novas
 
         if self.engine.last_bar:
             todo = [i for i, ts in enumerate(feat.index) if ts > pd.Timestamp(self.engine.last_bar)]
@@ -93,17 +102,35 @@ class Bot:
         for i in todo:
             closed_at = feat.index[i] + pd.Timedelta(minutes=self.cfg.interval_min)
             fresh = self.now() - closed_at <= MAX_SIGNAL_AGE
-            self._dispatch(self.engine.on_bar(feat, i, evaluate=(i == last_i and fresh)))
+            evaluate = i == last_i and fresh
+            deriv = self._deriv_snapshot(feat, i) if evaluate and feat["sig"].iloc[i] != 0 else None
+            self._dispatch(self.engine.on_bar(feat, i, evaluate=evaluate, deriv=deriv), deriv)
         if todo:
             self._save_state()
         return len(todo)
+
+    def _deriv_snapshot(self, feat: pd.DataFrame, i: int) -> dict | None:
+        """Funding/OI para o sinal da barra `i`. Falha silenciosa: são contexto, não podem parar o robô."""
+        per_hour = max(60 // self.cfg.interval_min, 1)
+        chg = None
+        if i >= per_hour:
+            chg = (float(feat["close"].iloc[i]) / float(feat["close"].iloc[i - per_hour]) - 1) * 100
+        return self._safe_snapshot(chg)
+
+    def _safe_snapshot(self, price_change_1h_pct: float | None = None) -> dict | None:
+        try:
+            return self.derivs.snapshot(price_change_1h_pct=price_change_1h_pct)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Falha ao calcular derivados: %s", e)
+            return None
 
     # ------------------------------------------------------------------ comandos
     def handle_commands(self) -> None:
         for cmd in self.tg.poll_commands():
             e = self.engine
             if cmd == "/status":
-                self.tg.send(messages.format_status(e, self.cfg, self.last_price, self.exchange))
+                self.tg.send(messages.format_status(e, self.cfg, self.last_price, self.exchange,
+                                                    self._safe_snapshot()))
             elif cmd == "/stats":
                 self.tg.send(messages.format_stats(e.stats(7), "Últimos 7 dias")
                              + "\n\n" + messages.format_stats(e.stats(), "Desde o início"))

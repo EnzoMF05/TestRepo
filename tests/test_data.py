@@ -75,9 +75,23 @@ def test_get_candles_falls_back_to_next_exchange(monkeypatch):
         raise DataError("bloqueado")
 
     monkeypatch.setitem(data._FETCHERS, "binance", boom)
+    monkeypatch.setitem(data._FETCHERS, "hyperliquid", boom)  # vem antes da bybit na ordem de reserva
     monkeypatch.setitem(data._FETCHERS, "bybit", lambda *a, **k: rows)
-    df, ex = data.get_candles("binance", "ZEC", "USDT", 15, 5)
+    df, ex = data.get_candles("binance", "ZEC", "USDT", 15, 5, allow_fallback=True)
     assert ex == "bybit" and len(df) == 5
+
+
+def test_no_fallback_by_default(monkeypatch):
+    """Operas na Hyperliquid: preços de outra exchange não servem, por isso a reserva é opt-in."""
+    rows = [[T0 + k * STEP, 1.0, 2.0, 0.5, 1.5, 10.0] for k in range(10)]
+
+    def boom(*a, **k):
+        raise DataError("bloqueado")
+
+    monkeypatch.setitem(data._FETCHERS, "hyperliquid", boom)
+    monkeypatch.setitem(data._FETCHERS, "bybit", lambda *a, **k: rows)
+    with pytest.raises(DataError):
+        data.get_candles("hyperliquid", "ZEC", "USDT", 15, 5)
 
 
 def test_get_candles_raises_when_everything_fails(monkeypatch):
@@ -87,4 +101,4 @@ def test_get_candles_raises_when_everything_fails(monkeypatch):
     for name in list(data._FETCHERS):
         monkeypatch.setitem(data._FETCHERS, name, boom)
     with pytest.raises(DataError):
-        data.get_candles("binance", "ZEC", "USDT", 15, 5)
+        data.get_candles("binance", "ZEC", "USDT", 15, 5, allow_fallback=True)

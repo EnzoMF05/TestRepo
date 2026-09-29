@@ -37,10 +37,20 @@ class Config:
     enable_commands: bool = False  # /status /pause /resume /stats (ver README: token partilhado!)
 
     # --- Mercado ---
-    exchange: str = "binance"  # binance | bybit | okx | kraken (as outras servem de reserva)
+    exchange: str = "hyperliquid"  # hyperliquid | binance | bybit | okx | kraken
+    allow_fallback: bool = False  # se a exchange falhar, usar outra? (os preços deixam de bater com a tua)
     base: str = "ZEC"
-    quote: str = "USDT"
+    quote: str = "USDT"  # só usado fora da Hyperliquid
     interval_min: int = 15
+
+    # --- Derivados (funding / open interest) ---
+    coinalyze_api_key: str = ""  # opcional: dá histórico de OI logo desde o arranque
+    coinalyze_symbol: str = ""  # opcional: ex. o símbolo que vês no Coinalyze; vazio = descobrir sozinho
+    funding_filter: bool = False  # bloqueia longs com funding muito alto / shorts com funding muito negativo
+    funding_limit_8h_pct: float = 0.05  # limite em % por 8h (a base da Hyperliquid é 0.01)
+    oi_filter: bool = False  # breakouts só com open interest a subir
+    oi_min_change_pct: float = 0.0
+    oi_lookback_hours: float = 1.0
 
     # --- Sinais ---
     side: str = "both"  # long | short | both
@@ -53,7 +63,7 @@ class Config:
     # --- Risco / custos ---
     account_size: float = 1000.0
     risk_pct: float = 1.0  # % da conta arriscada por trade (só afeta o tamanho sugerido)
-    fee_pct: float = 0.05  # comissão por lado (taker) em %
+    fee_pct: float = 0.045  # comissão por lado (taker base da Hyperliquid) em %
     slippage_pct: float = 0.03  # derrapagem por lado em %
 
     # --- Execução ---
@@ -88,6 +98,14 @@ class Config:
         c.telegram_chat_id = _get("TELEGRAM_CHAT_ID", c.telegram_chat_id)
         c.enable_commands = _bool("ENABLE_COMMANDS", c.enable_commands)
         c.exchange = _get("EXCHANGE", c.exchange).lower()
+        c.allow_fallback = _bool("ALLOW_FALLBACK", c.allow_fallback)
+        c.coinalyze_api_key = _get("COINALYZE_API_KEY", c.coinalyze_api_key)
+        c.coinalyze_symbol = _get("COINALYZE_SYMBOL", c.coinalyze_symbol)
+        c.funding_filter = _bool("FUNDING_FILTER", c.funding_filter)
+        c.funding_limit_8h_pct = float(_get("FUNDING_LIMIT_8H_PCT", str(c.funding_limit_8h_pct)))
+        c.oi_filter = _bool("OI_FILTER", c.oi_filter)
+        c.oi_min_change_pct = float(_get("OI_MIN_CHANGE_PCT", str(c.oi_min_change_pct)))
+        c.oi_lookback_hours = float(_get("OI_LOOKBACK_HOURS", str(c.oi_lookback_hours)))
         c.base = _get("BASE", c.base).upper()
         c.quote = _get("QUOTE", c.quote).upper()
         c.interval_min = int(_get("INTERVAL_MIN", str(c.interval_min)))

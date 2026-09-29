@@ -92,7 +92,7 @@ def test_short_stop_tp1_tp2():
 
 
 # ------------------------------------------------------------------ Engine: regras de risco
-def make_feat(n=200, sigs=None, stop_next=True, start="2026-01-01"):
+def make_feat(n=200, sigs=None, stop_next=True, start="2026-01-01", kind="pullback"):
     """Barras planas em 100; `sigs` = {índice: +1/-1}. Com stop_next, a barra seguinte apanha o stop (risco = 1)."""
     idx = pd.date_range(start, periods=n, freq="15min", tz="UTC")
     df = pd.DataFrame({"open": 100.0, "high": 100.1, "low": 99.9, "close": 100.0, "volume": 1.0}, index=idx)
@@ -100,7 +100,7 @@ def make_feat(n=200, sigs=None, stop_next=True, start="2026-01-01"):
     df["atr"], df["rsi"], df["adx"], df["htf"] = 1.0, 50.0, 25.0, 1
     for i, s in (sigs or {}).items():
         df.iloc[i, df.columns.get_loc("sig")] = s
-        df.iloc[i, df.columns.get_loc("kind")] = "pullback"
+        df.iloc[i, df.columns.get_loc("kind")] = kind
         df.iloc[i, df.columns.get_loc("risk")] = 1.0
         if stop_next:
             col, val = ("low", 98.5) if s > 0 else ("high", 101.5)
@@ -213,3 +213,59 @@ def test_state_roundtrip():
     e2 = Engine(cfg())
     e2.load(e.to_dict())
     assert e2.to_dict() == e.to_dict() and e2.trade is not None and e2.trade.side == "short"
+
+
+# ------------------------------------------------------------------ filtros de funding / OI
+def one_bar(engine, feat, i, deriv):
+    """Corre até à barra i-1 sem derivados e avalia a barra i com `deriv`."""
+    for j in range(i):
+        engine.on_bar(feat, j)
+    return engine.on_bar(feat, i, deriv=deriv)
+
+
+def test_filters_are_off_by_default():
+    feat = make_feat(n=90, sigs={10: 1})
+    ev = one_bar(Engine(cfg()), feat, 10, {"funding_8h_pct": 5.0, "oi_change_pct": -50.0})
+    assert kinds(ev) == ["signal"]
+
+
+@pytest.mark.parametrize("side,funding,blocked", [
+    (1, 0.06, True), (1, 0.05, False), (1, -0.20, False),  # long: só o funding muito positivo o trava
+    (-1, -0.06, True), (-1, -0.05, False), (-1, 0.20, False),  # short: só o muito negativo
+])
+def test_funding_filter(side, funding, blocked):
+    feat = make_feat(n=90, sigs={10: side})
+    e = Engine(cfg(funding_filter=True, funding_limit_8h_pct=0.05))
+    ev = one_bar(e, feat, 10, {"funding_8h_pct": funding, "oi_change_pct": None})
+    assert kinds(ev) == (["blocked"] if blocked else ["signal"])
+    if blocked:
+        assert "funding" in ev[0].data["reason"] and e.trade is None
+
+
+def test_blocked_setup_costs_nothing_and_is_not_repeated_by_cooldown():
+    feat = make_feat(n=90, sigs={10: 1, 12: 1})
+    e = Engine(cfg(funding_filter=True, cooldown_bars=4))
+    ev = one_bar(e, feat, 10, {"funding_8h_pct": 0.5})
+    assert kinds(ev) == ["blocked"] and e.day_signals == 0 and e.last_signal_time == ""
+    e.on_bar(feat, 11)
+    ev = e.on_bar(feat, 12, deriv={"funding_8h_pct": 0.01})  # 30 min depois, funding normal: entra
+    assert kinds(ev) == ["signal"]
+
+
+@pytest.mark.parametrize("kind,oi,blocked", [
+    ("breakout", -1.0, True), ("breakout", 0.5, False), ("breakout", 0.0, False),
+    ("pullback", -1.0, False),  # o filtro de OI só afeta rutura
+])
+def test_oi_filter_applies_to_breakouts_only(kind, oi, blocked):
+    feat = make_feat(n=90, sigs={10: 1}, kind=kind)
+    e = Engine(cfg(oi_filter=True, oi_min_change_pct=0.0))
+    ev = one_bar(e, feat, 10, {"funding_8h_pct": 0.01, "oi_change_pct": oi})
+    assert kinds(ev) == (["blocked"] if blocked else ["signal"])
+
+
+@pytest.mark.parametrize("deriv", [None, {}, {"funding_8h_pct": None, "oi_change_pct": None},
+                                   {"funding_8h_pct": float("nan"), "oi_change_pct": float("nan")}])
+def test_missing_derivs_data_never_blocks(deriv):
+    feat = make_feat(n=90, sigs={10: 1}, kind="breakout")
+    e = Engine(cfg(funding_filter=True, oi_filter=True))
+    assert kinds(one_bar(e, feat, 10, deriv)) == ["signal"]

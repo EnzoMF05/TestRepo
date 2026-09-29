@@ -14,10 +14,12 @@ from typing import Callable, Optional
 import pandas as pd
 import requests
 
+from . import hl
+
 log = logging.getLogger("zec_bot.data")
 
 TIMEOUT = 15
-EXCHANGES = ["binance", "bybit", "okx", "kraken"]
+EXCHANGES = ["hyperliquid", "binance", "bybit", "okx", "kraken"]
 
 _BINANCE_INTERVAL = {1: "1m", 5: "5m", 15: "15m", 30: "30m", 60: "1h"}
 _OKX_INTERVAL = {1: "1m", 5: "5m", 15: "15m", 30: "30m", 60: "1H"}
@@ -74,6 +76,14 @@ def _parse_kraken(payload: dict) -> list[list]:
 
 
 # ---------------------------------------------------------------------------- fetchers
+def _fetch_hyperliquid(base: str, quote: str, interval: int, end_ms: Optional[int], limit: int = 5000) -> list[list]:
+    # Perps da Hyperliquid: a "moeda" é só o ativo (ZEC), sem par. Só guarda as últimas 5000 barras.
+    try:
+        return hl.fetch_candles(base, interval, end_ms, limit)
+    except hl.HLError as e:
+        raise DataError(str(e)) from e
+
+
 def _fetch_binance(base: str, quote: str, interval: int, end_ms: Optional[int], limit: int = 1000) -> list[list]:
     params = {"symbol": f"{base}{quote}", "interval": _BINANCE_INTERVAL[interval], "limit": min(limit, 1000)}
     if end_ms:
@@ -108,12 +118,13 @@ def _fetch_kraken(base: str, quote: str, interval: int, end_ms: Optional[int], l
 
 
 _FETCHERS: dict[str, Callable[..., list[list]]] = {
+    "hyperliquid": _fetch_hyperliquid,
     "binance": _fetch_binance,
     "bybit": _fetch_bybit,
     "okx": _fetch_okx,
     "kraken": _fetch_kraken,
 }
-_PAGEABLE = {"binance", "bybit", "okx"}
+_PAGEABLE = {"hyperliquid", "binance", "bybit", "okx"}
 
 
 # ---------------------------------------------------------------------------- API pública
@@ -160,9 +171,14 @@ def fetch_exchange(exchange: str, base: str, quote: str, interval: int, n_bars: 
     return df.iloc[-n_bars:]
 
 
-def get_candles(preferred: str, base: str, quote: str, interval: int, n_bars: int) -> tuple[pd.DataFrame, str]:
-    """Tenta a exchange preferida e depois as restantes. Devolve (df, exchange_usada)."""
-    order = [preferred] + [e for e in EXCHANGES if e != preferred]
+def get_candles(preferred: str, base: str, quote: str, interval: int, n_bars: int,
+                allow_fallback: bool = False) -> tuple[pd.DataFrame, str]:
+    """Candles da exchange preferida. Com `allow_fallback`, tenta as outras se ela falhar.
+
+    Por defeito NÃO há reserva: operas na Hyperliquid, e níveis calculados com preços de outra
+    exchange não batem certo com o teu gráfico. Devolve (df, exchange_usada).
+    """
+    order = [preferred] + ([e for e in EXCHANGES if e != preferred] if allow_fallback else [])
     errors = []
     for ex in order:
         try:

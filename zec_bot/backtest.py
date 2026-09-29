@@ -1,8 +1,10 @@
 """Backtest da estratégia com o MESMO motor do robô live.
 
-    python -m zec_bot.backtest --days 180
-    python -m zec_bot.backtest --days 365 --exchange binance --save-csv zec_15m.csv
+    python -m zec_bot.backtest                      # Hyperliquid: só guarda as últimas 5000 barras (~52 dias)
+    python -m zec_bot.backtest --days 365 --exchange binance --save-csv zec_15m.csv   # histórico longo (proxy)
     python -m zec_bot.backtest --csv zec_15m.csv --side long
+    python -m zec_bot.backtest --funding-filter     # compara COM e SEM o filtro de funding (histórico da Hyperliquid)
+    python -m zec_bot.backtest --oi-filter          # idem para OI (precisa de COINALYZE_API_KEY; só ~2-3 semanas)
 
 Como ler os resultados (leitura honesta):
   * R = unidade de risco (1R = distância entrada-stop). Os resultados já incluem comissões e derrapagem.
@@ -13,27 +15,91 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import asdict
+import time
+from dataclasses import asdict, replace
+from typing import Optional
 
+import numpy as np
 import pandas as pd
 
+from . import hl
+from .coinalyze import Coinalyze
 from .config import Config
 from .data import fetch_exchange
+from .derivs import funding_series, oi_change_series
 from .engine import Engine, summarize
 from .strategy import Params, prepare
 
 
-def run_backtest(df: pd.DataFrame, cfg: Config, params: Params | None = None) -> tuple[list[dict], pd.DataFrame]:
+def run_backtest(df: pd.DataFrame, cfg: Config, params: Params | None = None, deriv: Optional[pd.DataFrame] = None,
+                 start: Optional[int] = None, blocked: Optional[list] = None) -> tuple[list[dict], pd.DataFrame]:
+    """`deriv`: DataFrame alinhado com `df` (colunas funding_8h_pct, oi_change_pct) para os filtros.
+    `blocked`: se for dada uma lista, recebe os setups que os filtros bloquearam."""
     p = params or Params()
     feat = prepare(df, p)
     engine = Engine(cfg, p)
     trades: list[dict] = []
-    start = min(p.warmup_bars, max(len(feat) - 1, 0))
-    for i in range(start, len(feat)):
-        for ev in engine.on_bar(feat, i):
+    first = min(p.warmup_bars, max(len(feat) - 1, 0)) if start is None else start
+    if deriv is not None:
+        deriv = deriv.reindex(feat.index)
+        fund, oi = deriv["funding_8h_pct"].to_numpy(), deriv["oi_change_pct"].to_numpy()
+    for i in range(first, len(feat)):
+        d = {"funding_8h_pct": fund[i], "oi_change_pct": oi[i]} if deriv is not None else None
+        for ev in engine.on_bar(feat, i, deriv=d):
             if ev.kind == "closed":
                 trades.append(asdict(ev.trade))
-    return trades, feat.iloc[start:]  # um trade ainda aberto no fim dos dados não conta
+            elif ev.kind == "blocked" and blocked is not None:
+                blocked.append(ev.data)
+    return trades, feat.iloc[first:]  # um trade ainda aberto no fim dos dados não conta
+
+
+def build_deriv(index: pd.DatetimeIndex, cfg: Config, need_oi: bool) -> pd.DataFrame:
+    """Funding (histórico da Hyperliquid) e, se pedido, variação de OI (Coinalyze) alinhados com as barras."""
+    start_ms = int(index[0].timestamp() * 1000) - 2 * 3600 * 1000
+    fund = funding_series(hl.fetch_funding_history(cfg.base, start_ms), index, cfg.interval_min)
+    oi = pd.Series(np.nan, index=index)
+    if need_oi:
+        cz = Coinalyze(cfg.coinalyze_api_key, cfg.coinalyze_symbol, cfg.base)
+        if not cz.enabled:
+            raise SystemExit("O filtro de OI precisa de COINALYZE_API_KEY no .env (chave gratuita do Coinalyze).")
+        hours = (index[-1] - index[0]).total_seconds() / 3600 + cfg.oi_lookback_hours + 2
+        oi = oi_change_series(cz.oi_history("15min", hours=hours, now=time.time()), index, cfg.interval_min,
+                              cfg.oi_lookback_hours)
+    return pd.DataFrame({"funding_8h_pct": fund, "oi_change_pct": oi})
+
+
+def first_valid_bar(deriv: pd.DataFrame, cfg: Config, floor: int) -> int:
+    """Primeira barra (>= floor) em que existem TODOS os dados exigidos pelos filtros ligados."""
+    ok = np.ones(len(deriv), dtype=bool)
+    if cfg.funding_filter:
+        ok &= deriv["funding_8h_pct"].notna().to_numpy()
+    if cfg.oi_filter:
+        ok &= deriv["oi_change_pct"].notna().to_numpy()
+    ok[:floor] = False
+    if not ok.any():
+        raise SystemExit("Sem barras com dados de funding/OI para os filtros pedidos.")
+    return int(np.argmax(ok))
+
+
+def compare(base: list[dict], filt: list[dict], blocked: list, feat: pd.DataFrame) -> str:
+    mid = feat.index[len(feat) // 2].isoformat()
+
+    def parts(t):
+        return summarize([x for x in t if x["close_time"] < mid]), summarize([x for x in t if x["close_time"] >= mid])
+
+    (b1, b2), (f1, f2) = parts(base), parts(filt)
+    out = ["— Efeito dos filtros (mesmo período) —",
+           _line("sem filtros", summarize(base)), _line("com filtros", summarize(filt)),
+           _line("  sem, 1ª metade", b1), _line("  com, 1ª metade", f1),
+           _line("  sem, 2ª metade", b2), _line("  com, 2ª metade", f2),
+           f"Setups bloqueados pelos filtros: {len(blocked)}"]
+    if len(filt) < 100:
+        out.append("⚠️ Menos de 100 trades com filtros: a diferença pode ser puro acaso.")
+    better = [summarize(filt)["total_r"] > summarize(base)["total_r"], f1["total_r"] > b1["total_r"],
+              f2["total_r"] > b2["total_r"]]
+    if not all(better):
+        out.append("⚠️ Os filtros não melhoram o resultado total E as duas metades: não há evidência de que ajudem.")
+    return "\n".join(out)
 
 
 def max_drawdown(rs: list[float]) -> float:
@@ -110,12 +176,14 @@ def load_csv(path: str) -> pd.DataFrame:
 def main() -> int:
     ap = argparse.ArgumentParser(prog="zec_bot.backtest")
     ap.add_argument("--days", type=int, default=180)
-    ap.add_argument("--exchange", default=None, help="binance | bybit | okx (kraken só tem ~7 dias)")
+    ap.add_argument("--exchange", default=None, help="hyperliquid (~52 dias) | binance | bybit | okx (histórico longo)")
     ap.add_argument("--csv", help="usa um CSV guardado em vez de ir à exchange")
     ap.add_argument("--save-csv", help="guarda os candles descarregados")
     ap.add_argument("--side", choices=["long", "short", "both"])
     ap.add_argument("--fee", type=float, help="comissão por lado, em %%")
     ap.add_argument("--slippage", type=float, help="derrapagem por lado, em %%")
+    ap.add_argument("--funding-filter", action="store_true", help="compara com/sem o filtro de funding")
+    ap.add_argument("--oi-filter", action="store_true", help="compara com/sem o filtro de OI (Coinalyze)")
     ap.add_argument("--trades-csv", default="zec_backtest_trades.csv")
     args = ap.parse_args()
 
@@ -126,14 +194,21 @@ def main() -> int:
         cfg.fee_pct = args.fee
     if args.slippage is not None:
         cfg.slippage_pct = args.slippage
+    cfg.funding_filter = cfg.funding_filter or args.funding_filter
+    cfg.oi_filter = cfg.oi_filter or args.oi_filter
     p = Params()
 
+    exchange = args.exchange or cfg.exchange
     if args.csv:
         df = load_csv(args.csv)
     else:
         n = args.days * 24 * 60 // cfg.interval_min + p.warmup_bars
-        print(f"A descarregar ~{n} barras de {args.exchange or cfg.exchange} (pode demorar)…")
-        df = fetch_exchange(args.exchange or cfg.exchange, cfg.base, cfg.quote, cfg.interval_min, n)
+        print(f"A descarregar ~{n} barras de {exchange} (pode demorar)…")
+        df = fetch_exchange(exchange, cfg.base, cfg.quote, cfg.interval_min, n)
+        if len(df) < 0.95 * n:
+            extra = (" A Hyperliquid só guarda as últimas 5000 barras; para mais histórico usa --exchange binance"
+                     " (preços muito próximos, mas não idênticos)." if exchange == "hyperliquid" else "")
+            print(f"Nota: só há {len(df)} barras das {n} pedidas.{extra}")
         if args.save_csv:
             df.to_csv(args.save_csv)
             print(f"Guardado em {args.save_csv}")
@@ -141,8 +216,19 @@ def main() -> int:
     if len(df) <= p.warmup_bars + 100:
         print(f"Dados insuficientes ({len(df)} barras).")
         return 1
-    trades, feat = run_backtest(df, cfg, p)
-    print(report(trades, feat, cfg))
+
+    if cfg.funding_filter or cfg.oi_filter:
+        deriv = build_deriv(df.index, cfg, need_oi=cfg.oi_filter)
+        start = first_valid_bar(deriv, cfg, p.warmup_bars)
+        no_filters = replace(cfg, funding_filter=False, oi_filter=False)
+        blocked: list = []
+        base, feat = run_backtest(df, no_filters, p, deriv=deriv, start=start)
+        trades, _ = run_backtest(df, cfg, p, deriv=deriv, start=start, blocked=blocked)
+        print(report(base, feat, no_filters))
+        print("\n" + compare(base, trades, blocked, feat))
+    else:
+        trades, feat = run_backtest(df, cfg, p)
+        print(report(trades, feat, cfg))
     if trades:
         pd.DataFrame(trades).to_csv(args.trades_csv, index=False)
         print(f"\nTrades guardados em {args.trades_csv}")
