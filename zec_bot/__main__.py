@@ -8,8 +8,9 @@ import argparse
 import logging
 import sys
 
+import pandas as pd
+
 from .bot import Bot
-from .coinalyze import Coinalyze
 from .config import Config
 from .data import get_candles
 from .derivs import DerivsMonitor
@@ -18,10 +19,21 @@ from .strategy import Params, prepare
 from .telegram import Telegram
 
 
+def _crowd_state(row, p: Params) -> str:
+    f8, pc = row["funding_8h_pct"], row["funding_pctl"]
+    if pd.isna(f8) or pd.isna(pc):
+        return "sem dados suficientes"
+    if f8 >= p.rev_short_min_funding_8h and pc >= p.rev_short_min_pctl:
+        return "LONGS sobrelotados → a estratégia só procura SHORTS de reversão"
+    if f8 <= p.rev_long_max_funding_8h and pc <= p.rev_long_max_pctl:
+        return "SHORTS sobrelotados (extremo) → a estratégia só procura LONGS de reversão"
+    return "neutro → sem reversões possíveis agora"
+
+
 def check(cfg: Config) -> int:
-    p = Params()
-    print(f"Config: {cfg.base}/{cfg.quote} · {cfg.interval_str} · exchange={cfg.exchange} · lado={cfg.side} · "
-          f"conta={cfg.account_size:g} · risco={cfg.risk_pct:g}%")
+    p = Params.from_cfg(cfg)
+    print(f"Config: {cfg.base} · {cfg.interval_str} · candles={cfg.exchange} · derivados=Binance {cfg.derivs_symbol} · "
+          f"estratégia={cfg.strategy} · lado={cfg.side} · conta={cfg.account_size:g} · risco={cfg.risk_pct:g}%")
     print(f"Telegram configurado: {'sim' if cfg.telegram_ready else 'NÃO (as mensagens vão para a consola)'}")
 
     print("\n1) A obter candles…")
@@ -33,36 +45,36 @@ def check(cfg: Config) -> int:
         return 1
     print(f"   ✔ {len(df)} barras de {ex}; última barra fechada: {df.index[-1]} · close {_px(df['close'].iloc[-1])}")
 
-    feat = prepare(df, p)
-    last = feat.iloc[-1]
-    n_sig = int((feat["sig"] != 0).iloc[-400:].sum())
-    print(f"\n2) Estado atual: tendência 1h={'alta' if last['htf'] > 0 else 'baixa' if last['htf'] < 0 else 'neutra'} · "
-          f"ADX {last['adx']:.1f} · RSI {last['rsi']:.1f} · ATR {last['atr'] / last['close'] * 100:.2f}%")
-    print(f"   Sinais brutos nas últimas 400 barras: {n_sig}")
-
-    print("\n3) Derivados (funding / open interest)…")
+    print("\n2) Derivados da Binance (funding / open interest)…")
     mon = DerivsMonitor(cfg)
-    snap = mon.snapshot()
-    if snap is None:
-        print(f"   ✖ Hyperliquid (metaAndAssetCtxs) FALHOU: {mon.last_error}")
+    frame = mon.frame(df.index)
+    snap = mon.snapshot(frame_row=None if frame is None else frame.iloc[-1])
+    if frame is None or snap is None:
+        print(f"   ✖ FALHOU: {mon.last_error}")
+        if cfg.needs_derivs:
+            print("     Sem isto a estratégia de reversão não gera sinais. Resolve antes de avançar.")
     else:
-        print(f"   ✔ Hyperliquid: funding {snap['funding_8h_pct']:+.4f}%/8h ({snap['funding_hr_pct']:+.5f}%/h) · "
-              f"prémio {snap['premium_pct']:+.3f}% · OI {snap['oi_coins']:,.0f} {cfg.base} ≈ {snap['oi_usd'] / 1e6:.2f}M$ · "
-              f"alavancagem máx. {snap['max_leverage']:.0f}x")
-        print("     (a variação de OI só aparece depois de o robô recolher amostras ao longo de 1h; "
-              "com Coinalyze aparece já)")
-    if not cfg.coinalyze_api_key:
-        print("   – Coinalyze: não configurado (opcional: COINALYZE_API_KEY dá histórico de OI logo no arranque)")
-    else:
-        cz = Coinalyze(cfg.coinalyze_api_key, cfg.coinalyze_symbol, cfg.base)
-        try:
-            hist = cz.oi_history("15min", hours=6)
-            print(f"   ✔ Coinalyze: símbolo {cz.symbol} · {len(hist)} barras de 15m · último OI {hist['c'].iloc[-1]:,.0f} "
-                  f"(compara com o site; se o símbolo estiver errado define COINALYZE_SYMBOL)")
-            oi1, _ = DerivsMonitor(cfg, coinalyze=cz).oi_change_pct(1.0)
-            print(f"     variação de OI na última hora: {'n/d' if oi1 is None else f'{oi1:+.2f}%'}")
-        except Exception as e:  # noqa: BLE001
-            print(f"   ✖ Coinalyze FALHOU: {e}")
+        rows = mon.funding_rows()
+        pc = snap["funding_pctl"]
+        print(f"   ✔ funding {snap['funding_8h_pct']:+.4f}%/8h ({'percentil n/d' if pc is None else f'P{pc:.0f}'} dos últimos "
+              f"{cfg.crowd_window_days:g}d, {len(rows)} registos) · prémio {snap['premium_pct']:+.3f}%")
+        print(f"     OI {snap['oi_coins']:,.0f} {cfg.base} ≈ {snap['oi_usd'] / 1e6:.2f}M$ · variação 1h "
+              f"{'n/d' if snap['oi_change_1h_pct'] is None else format(snap['oi_change_1h_pct'], '+.2f') + '%'} · "
+              f"4h {'n/d' if snap['oi_change_4h_pct'] is None else format(snap['oi_change_4h_pct'], '+.2f') + '%'} · "
+              f"{cfg.rev_oi_hours:g}h {'n/d' if snap['oi_rev_pct'] is None else format(snap['oi_rev_pct'], '+.2f') + '%'}")
+        if snap["hl_funding_8h_pct"] is not None:
+            print(f"     Hyperliquid (onde pagas): funding {snap['hl_funding_8h_pct']:+.4f}%/8h · "
+                  f"alavancagem máx. {snap['max_leverage']:.0f}x")
+        print("     (compara estes números com o que vês no Coinalyze para ZECUSDT da Binance)")
+        print(f"   Estado de crowding agora: {_crowd_state(frame.iloc[-1], p)}")
+
+    feat = prepare(df, p, deriv=frame)
+    last = feat.iloc[-1]
+    recent = feat.iloc[-400:]
+    by_kind = recent[recent["sig"] != 0]["kind"].value_counts().to_dict()
+    print(f"\n3) Estado atual: tendência 1h={'alta' if last['htf'] > 0 else 'baixa' if last['htf'] < 0 else 'neutra'} · "
+          f"ADX {last['adx']:.1f} · RSI {last['rsi']:.1f} · ATR {last['atr'] / last['close'] * 100:.2f}%")
+    print(f"   Sinais brutos nas últimas 400 barras: {by_kind or 'nenhum'}")
 
     print("\n4) A enviar mensagem de teste para o Telegram…")
     ok = Telegram(cfg.telegram_token, cfg.telegram_chat_id).send(

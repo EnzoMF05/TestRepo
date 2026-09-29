@@ -80,30 +80,6 @@ def test_parse_asset_ctx_errors():
         hl.parse_asset_ctx(bad, "ZEC")
 
 
-def test_funding_history_paginates_500_at_a_time_and_dedups(monkeypatch):
-    hour = 3_600_000
-    all_rows = [{"coin": "ZEC", "fundingRate": "0.0000125", "premium": "0.0001", "time": T0 + k * hour}
-                for k in range(1120)]
-    calls = []
-
-    def fake_post(payload):
-        calls.append(payload["startTime"])
-        return [r for r in all_rows if r["time"] >= payload["startTime"]][:500]
-
-    monkeypatch.setattr(hl, "post_info", fake_post)
-    monkeypatch.setattr(hl.time, "sleep", lambda s: None)
-    rows = hl.fetch_funding_history("ZEC", T0)
-    assert len(rows) == 1120 and [r[0] for r in rows] == sorted({r[0] for r in rows})
-    assert len(calls) == 3 and calls[1] == T0 + 499 * hour + 1  # logo depois do último registo (nº 499)
-
-
-def test_funding_history_rejects_garbage():
-    with pytest.raises(hl.HLError):
-        hl.parse_funding({"error": "x"})
-    with pytest.raises(hl.HLError):
-        hl.parse_funding([{"time": 1}])
-
-
 def test_hyperliquid_is_a_pageable_source_that_stops_at_its_5000_limit(monkeypatch):
     """Pede mais do que a Hyperliquid guarda: tem de devolver o que há, sem ciclar."""
     available = [candle(T0 + k * STEP) for k in range(300)]

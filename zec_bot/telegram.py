@@ -1,7 +1,9 @@
 """Envio (e, opcionalmente, receção de comandos) via Telegram Bot API."""
 from __future__ import annotations
 
+import html
 import logging
+import re
 import time
 
 import requests
@@ -20,23 +22,27 @@ class Telegram:
     def ready(self) -> bool:
         return bool(self.token and self.chat_id)
 
-    def send(self, text: str) -> bool:
-        """Envia uma mensagem (HTML). Sem token configurado, imprime na consola (modo de teste)."""
+    def send(self, text: str, _html: bool = True) -> bool:
+        """Envia uma mensagem (HTML). Sem token configurado, imprime na consola (modo de teste).
+
+        Se o Telegram rejeitar o HTML (um "<" solto chega para isso), reenvia em texto simples: é melhor
+        receber o aviso sem formatação do que não o receber.
+        """
         if not self.ready:
             print("\n[TELEGRAM não configurado — a imprimir na consola]\n" + text + "\n")
             return True
         for attempt in range(3):
             try:
-                r = requests.post(
-                    API.format(token=self.token, method="sendMessage"),
-                    json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML",
-                          "disable_web_page_preview": True},
-                    timeout=15,
-                )
+                payload = {"chat_id": self.chat_id, "text": text, "disable_web_page_preview": True}
+                if _html:
+                    payload["parse_mode"] = "HTML"
+                r = requests.post(API.format(token=self.token, method="sendMessage"), json=payload, timeout=15)
                 if r.status_code == 200:
                     return True
                 log.warning("Telegram devolveu %s: %s", r.status_code, r.text[:200])
-                if r.status_code in (400, 401, 403, 404):  # erro nosso (token, chat id, HTML): não repetir
+                if r.status_code == 400 and _html and "parse entities" in r.text.lower():
+                    return self.send(html.unescape(re.sub(r"</?[a-z]+>", "", text)), _html=False)
+                if r.status_code in (400, 401, 403, 404):  # erro nosso (token, chat id): não repetir
                     return False
             except requests.RequestException as e:
                 log.warning("Telegram falhou (%s), tentativa %d/3", e, attempt + 1)

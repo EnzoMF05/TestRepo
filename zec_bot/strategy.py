@@ -1,8 +1,17 @@
 """Estratégia de day trading para ZEC (barras de 15m, contexto de 1h).
 
-Duas configurações, sempre a favor da tendência de 1h:
+Modo "reversal" (o teu estilo): contra o excesso, com três condições em simultâneo
+  1. mercado CARREGADO: funding da Binance extremo para este ativo (percentil + mínimo absoluto)
+       - longs sobrelotados (funding alto)    -> só SHORT
+       - shorts sobrelotados (funding muito negativo) -> só LONG
+  2. preço ESTICADO ("caro"/"barato"): afastado da EMA55 em ATR e RSI quente/frio nas últimas 3 barras
+  3. GATILHO de rejeição: candle contra o excesso (pavio de rejeição ou fecho abaixo/acima da mínima/máxima
+     anterior, com o RSI a virar). Nunca entra só porque "está caro": espera a viragem.
+
+Modo "trend": a favor da tendência de 1h, duas configurações:
   * pullback : recuo até à EMA rápida e recuperação (candle de retoma, RSI a virar, lado certo do VWAP)
   * breakout : fecho acima/abaixo do canal de N barras com volume acima da média
+  Com `avoid_expensive_longs` não abre longs quando o preço já está "caro".
 
 Todos os cálculos usam apenas barras FECHADAS e dados passados; a tendência de 1h só fica
 disponível depois de a barra de 1h fechar (ver `_htf_trend`).
@@ -12,12 +21,13 @@ validados com dados reais. Corre `python -m zec_bot.backtest` antes de confiares
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
 from . import indicators as ind
+from .config import Config
 
 
 @dataclass
@@ -47,6 +57,36 @@ class Params:
     tp1_r: float = 1.5
     tp2_r: float = 3.0
 
+    # --- modo e "caro" (aplica-se à estratégia de tendência) ---
+    mode: str = "trend"  # trend | reversal | both   (Config.strategy escolhe o do utilizador: reversal)
+    avoid_expensive_longs: bool = False
+    avoid_ext_atr: float = 2.0  # "caro" = a mais de 2 ATR acima da EMA55...
+    avoid_rsi: float = 70.0  # ... ou RSI >= 70
+
+    # --- reversão ---
+    rev_short_min_pctl: float = 90.0
+    rev_short_min_funding_8h: float = 0.03
+    rev_long_max_pctl: float = 5.0
+    rev_long_max_funding_8h: float = -0.02
+    rev_use_oi: bool = False
+    rev_oi_min_pct: float = 3.0
+    rev_ext_atr: float = 2.5  # esticado: >= 2.5 ATR da EMA55 em alguma das últimas 3 barras
+    rev_rsi: float = 65.0  # RSI >= 65 (short) / <= 35 (long) em alguma das últimas 3 barras
+    rev_wick: float = 0.35  # pavio de rejeição >= 35% da barra
+    rev_swing_bars: int = 8
+    rev_stop_max_atr: float = 3.0
+    rev_tp1_r: float = 1.0  # reversão: alvos mais curtos (regressão à média), taxa de acerto mais alta
+    rev_tp2_r: float = 2.0
+
+    @classmethod
+    def from_cfg(cls, cfg: Config) -> "Params":
+        return cls(
+            mode=cfg.strategy, avoid_expensive_longs=cfg.avoid_expensive_longs,
+            rev_short_min_pctl=cfg.rev_short_min_pctl, rev_short_min_funding_8h=cfg.rev_short_min_funding_8h,
+            rev_long_max_pctl=cfg.rev_long_max_pctl, rev_long_max_funding_8h=cfg.rev_long_max_funding_8h,
+            rev_use_oi=cfg.rev_use_oi, rev_oi_min_pct=cfg.rev_oi_min_pct,
+        )
+
     @property
     def warmup_bars(self) -> int:
         """Nº de barras de 15m necessárias para as EMAs (sobretudo a de 1h) estabilizarem."""
@@ -68,6 +108,9 @@ class Signal:
     rsi: float
     adx: float
     htf: int
+    tp1_r: float = 1.5
+    tp2_r: float = 3.0
+    info: dict = field(default_factory=dict)  # contexto do sinal para a mensagem (reversão)
 
 
 def _htf_trend(df: pd.DataFrame, p: Params) -> pd.Series:
@@ -89,8 +132,11 @@ def _htf_trend(df: pd.DataFrame, p: Params) -> pd.Series:
     return aligned.fillna(0).astype(int)
 
 
-def prepare(df: pd.DataFrame, p: Params | None = None) -> pd.DataFrame:
-    """Devolve o DataFrame com indicadores e colunas `sig` (+1/-1/0), `kind` e `risk`."""
+def prepare(df: pd.DataFrame, p: Params | None = None, deriv: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Devolve o DataFrame com indicadores e colunas `sig` (+1/-1/0), `kind`, `risk`, `tp1_r`, `tp2_r`.
+
+    `deriv`: features de funding/OI por barra (`derivs.build_frame`). Sem elas, a reversão não gera sinais.
+    """
     p = p or Params()
     f = df.copy()
     c, o, h, l = f["close"], f["open"], f["high"], f["low"]
@@ -105,6 +151,8 @@ def prepare(df: pd.DataFrame, p: Params | None = None) -> pd.DataFrame:
     f["don_hi"] = h.rolling(p.donchian).max().shift(1)
     f["don_lo"] = l.rolling(p.donchian).min().shift(1)
     f["htf"] = _htf_trend(f, p)
+    for col in ("funding_8h_pct", "funding_pctl", "oi_rev_pct"):
+        f[col] = deriv[col].reindex(f.index).to_numpy() if deriv is not None and col in deriv else np.nan
 
     bull, bear = f["htf"] == 1, f["htf"] == -1
     trending = f["adx"] >= p.adx_min
@@ -151,21 +199,67 @@ def prepare(df: pd.DataFrame, p: Params | None = None) -> pd.DataFrame:
     long_bo, long_pb = long_bo & ok_long, long_pb & ok_long
     short_bo, short_pb = short_bo & ok_short, short_pb & ok_short
 
+    # ---------- "caro": sem longs de tendência quando o preço já subiu demasiado ----------
+    ext_slow_up = (c - f["ema_s"]) / f["atr"]
+    ext_slow_dn = (f["ema_s"] - c) / f["atr"]
+    if p.avoid_expensive_longs:
+        expensive = (ext_slow_up >= p.avoid_ext_atr) | (f["rsi"] >= p.avoid_rsi)
+        long_pb, long_bo = long_pb & ~expensive, long_bo & ~expensive
+    if p.mode == "reversal":
+        long_pb = long_bo = short_pb = short_bo = pd.Series(False, index=f.index)
+
+    # ---------- REVERSÃO: mercado carregado + preço esticado + gatilho de rejeição ----------
+    stretch_up = ext_slow_up.rolling(3).max()
+    stretch_dn = ext_slow_dn.rolling(3).max()
+    f["stretch_up"], f["stretch_dn"] = stretch_up, stretch_dn
+    f["rsi_hi3"], f["rsi_lo3"] = f["rsi"].rolling(3).max(), f["rsi"].rolling(3).min()
+    body_hi, body_lo = np.maximum(o, c), np.minimum(o, c)
+    up_wick, lo_wick = (h - body_hi) / rng, (body_lo - l) / rng
+
+    crowd_long = (f["funding_8h_pct"] >= p.rev_short_min_funding_8h) & (f["funding_pctl"] >= p.rev_short_min_pctl)
+    crowd_short = (f["funding_8h_pct"] <= p.rev_long_max_funding_8h) & (f["funding_pctl"] <= p.rev_long_max_pctl)
+    if p.rev_use_oi:  # posições a acumular: OI a subir; sem dados de OI => sem sinal (nunca adivinha)
+        oi_grew = f["oi_rev_pct"] >= p.rev_oi_min_pct
+        crowd_long, crowd_short = crowd_long & oi_grew, crowd_short & oi_grew
+
+    rev_short = (
+        crowd_long & (stretch_up >= p.rev_ext_atr) & (f["rsi_hi3"] >= p.rev_rsi)
+        & (c < o) & ((up_wick >= p.rev_wick) | (c < l.shift(1))) & (f["rsi"] < rsi_prev)
+    )
+    rev_long = (
+        crowd_short & (stretch_dn >= p.rev_ext_atr) & (f["rsi_lo3"] <= 100 - p.rev_rsi)
+        & (c > o) & ((lo_wick >= p.rev_wick) | (c > h.shift(1))) & (f["rsi"] > rsi_prev)
+    )
+    if p.mode == "trend" or deriv is None:
+        rev_short = rev_long = pd.Series(False, index=f.index)
+
+    # stop além do extremo recente (reversão): mais folga que na tendência
+    swing = p.rev_swing_bars
+    rrisk_long = np.maximum(c - (l.rolling(swing).min() - p.stop_buffer_atr * atr_), p.stop_min_atr * atr_)
+    rrisk_short = np.maximum((h.rolling(swing).max() + p.stop_buffer_atr * atr_) - c, p.stop_min_atr * atr_)
+    rev_long = rev_long & (rrisk_long <= p.rev_stop_max_atr * atr_) & (rrisk_long / c * 100 >= p.min_risk_pct)
+    rev_short = rev_short & (rrisk_short <= p.rev_stop_max_atr * atr_) & (rrisk_short / c * 100 >= p.min_risk_pct)
+
     sig = np.zeros(len(f), dtype=int)
     kind = np.full(len(f), "", dtype=object)
     risk = np.full(len(f), np.nan)
-    # Ordem de prioridade (o último a escrever ganha): pullback < breakout
-    for mask, s, k, r in (
-        (long_pb, 1, "pullback", risk_long),
-        (short_pb, -1, "pullback", risk_short),
-        (long_bo, 1, "breakout", risk_long),
-        (short_bo, -1, "breakout", risk_short),
+    tp1_r = np.full(len(f), np.nan)
+    tp2_r = np.full(len(f), np.nan)
+    # Ordem de prioridade (o último a escrever ganha): pullback < breakout < reversão
+    for mask, s_, k, r, t1, t2 in (
+        (long_pb, 1, "pullback", risk_long, p.tp1_r, p.tp2_r),
+        (short_pb, -1, "pullback", risk_short, p.tp1_r, p.tp2_r),
+        (long_bo, 1, "breakout", risk_long, p.tp1_r, p.tp2_r),
+        (short_bo, -1, "breakout", risk_short, p.tp1_r, p.tp2_r),
+        (rev_long, 1, "reversal", rrisk_long, p.rev_tp1_r, p.rev_tp2_r),
+        (rev_short, -1, "reversal", rrisk_short, p.rev_tp1_r, p.rev_tp2_r),
     ):
         m = mask.fillna(False).to_numpy()
-        sig[m] = s
+        sig[m] = s_
         kind[m] = k
         risk[m] = r.to_numpy()[m]
-    f["sig"], f["kind"], f["risk"] = sig, kind, risk
+        tp1_r[m], tp2_r[m] = t1, t2
+    f["sig"], f["kind"], f["risk"], f["tp1_r"], f["tp2_r"] = sig, kind, risk, tp1_r, tp2_r
     return f
 
 
@@ -177,17 +271,31 @@ def signal_at(feat: pd.DataFrame, i: int, p: Params | None = None) -> Signal | N
     if s == 0:
         return None
     entry, risk = float(row["close"]), float(row["risk"])
+    t1, t2 = float(row["tp1_r"]), float(row["tp2_r"])
+    info = {}
+    if row["kind"] == "reversal":
+        up = s < 0  # short: o excesso foi para cima
+        info = {
+            "stretch_atr": float(row["stretch_up"] if up else row["stretch_dn"]),
+            "rsi_extreme": float(row["rsi_hi3"] if up else row["rsi_lo3"]),
+            "funding_8h_pct": float(row["funding_8h_pct"]),
+            "funding_pctl": float(row["funding_pctl"]),
+            "oi_rev_pct": None if pd.isna(row["oi_rev_pct"]) else float(row["oi_rev_pct"]),
+        }
     return Signal(
         time=feat.index[i],
         side="long" if s > 0 else "short",
         kind=str(row["kind"]),
         entry=entry,
         stop=entry - s * risk,
-        tp1=entry + s * p.tp1_r * risk,
-        tp2=entry + s * p.tp2_r * risk,
+        tp1=entry + s * t1 * risk,
+        tp2=entry + s * t2 * risk,
         risk=risk,
         atr=float(row["atr"]),
         rsi=float(row["rsi"]),
         adx=float(row["adx"]),
         htf=int(row["htf"]),
+        tp1_r=t1,
+        tp2_r=t2,
+        info=info,
     )

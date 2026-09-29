@@ -4,8 +4,8 @@
 
 Gestão do trade (por sinal):
   * stop inicial = -1R
-  * TP1 (1.5R): fecha 50% e o stop passa a breakeven
-  * TP2 (3R): fecha os restantes 50%
+  * TP1 (1.5R na tendência, 1R na reversão): fecha 50% e o stop passa a breakeven
+  * TP2 (3R na tendência, 2R na reversão): fecha os restantes 50%
   * se uma barra tocar em stop e alvo, assume-se o pior caso (stop primeiro)
   * saída a mercado ao fim de `max_hold_bars`
 """
@@ -41,6 +41,8 @@ class Trade:
     close_time: str = ""
     r_gross: float = 0.0
     r_net: float = 0.0
+    tp1_r: float = 1.5  # alvos em R deste trade (a reversão usa alvos mais curtos que a tendência)
+    tp2_r: float = 3.0
 
     @property
     def d(self) -> int:
@@ -72,7 +74,7 @@ class Trade:
                 return ["closed"]
             if self._reached(self.tp1, high, low):
                 self.state = "tp1"
-                self.realized_r = 0.5 * p.tp1_r
+                self.realized_r = 0.5 * self.tp1_r
                 self.stop = self.entry
                 events.append("tp1")
 
@@ -83,7 +85,7 @@ class Trade:
                 events.append("closed")
                 return events
             if self._reached(self.tp2, high, low):
-                self._close(self.realized_r + 0.5 * p.tp2_r, "tp2", time)
+                self._close(self.realized_r + 0.5 * self.tp2_r, "tp2", time)
                 events.append("closed")
                 return events
 
@@ -157,7 +159,7 @@ class Engine:
     def _deriv_block(self, sig: Signal, deriv: Optional[dict]) -> Optional[str]:
         """Motivo para bloquear o sinal por funding/OI (só com os filtros ligados). Sem dados: não bloqueia."""
         c = self.cfg
-        if not deriv:
+        if not deriv or sig.kind == "reversal":  # a reversão usa o funding como GATILHO, não como filtro
             return None
         f = deriv.get("funding_8h_pct")
         if c.funding_filter and f is not None and not np.isnan(f):
@@ -214,7 +216,8 @@ class Engine:
                 self.trade = self._open(sig, iso)
                 self.day_signals += 1
                 self.last_signal_time = iso
-                events.append(Event("signal", self.trade, data={"htf": sig.htf, "rsi": sig.rsi, "adx": sig.adx}))
+                events.append(Event("signal", self.trade, data={"htf": sig.htf, "rsi": sig.rsi, "adx": sig.adx,
+                                                                "info": sig.info}))
         return events
 
     def _open(self, sig: Signal, iso: str) -> Trade:
@@ -223,6 +226,7 @@ class Engine:
         return Trade(
             id=self.seq, side=sig.side, kind=sig.kind, entry=sig.entry, stop=sig.stop, stop0=sig.stop,
             tp1=sig.tp1, tp2=sig.tp2, risk=sig.risk, open_time=iso, cost_r=cost_r,
+            tp1_r=sig.tp1_r, tp2_r=sig.tp2_r,
         )
 
     # ------------------------------------------------------------------ estatísticas

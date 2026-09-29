@@ -2,37 +2,32 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from zec_bot import coinalyze as cz_mod
-from zec_bot.coinalyze import Coinalyze, CoinalyzeError
+from fakes import Clock, FakeBinance
+
+from zec_bot.binance_futures import BinanceError
 from zec_bot.config import Config
-from zec_bot.derivs import (KEEP_S, SAMPLE_EVERY_S, DerivsMonitor, funding_8h_pct, funding_series, interpret,
-                            oi_change_series)
+from zec_bot.derivs import (FUNDING_TTL_S, OI_TTL_S, STALE_FUNDING_S, DerivsMonitor, build_frame, funding_8h_pct,
+                            funding_features, interpret, oi_change_series)
 
-H = 3600.0
+from fakes import H, M15
 
-
-def ctx(oi=1_000_000.0, mark=50.0, funding=0.0000125):
-    return {"funding_hr": funding, "oi_coins": oi, "mark": mark, "oracle": mark, "premium": 0.0002,
-            "day_vol_usd": 1e7, "max_leverage": 5.0}
+T0 = int(pd.Timestamp("2026-03-01 00:00", tz="UTC").timestamp() * 1000)
 
 
-class Clock:
-    def __init__(self, t=1_700_000_000.0):
-        self.t = t
-
-    def __call__(self):
-        return self.t
+def bars(start="2026-03-10 00:00", n=96):
+    return pd.date_range(start, periods=n, freq="15min", tz="UTC")
 
 
-def monitor(clock, fetch=None, coinalyze=None, **cfg_kw):
-    return DerivsMonitor(Config(**cfg_kw), fetch_ctx=fetch or (lambda: ctx()), coinalyze=coinalyze or Coinalyze(""),
-                         now=clock)
+def funding_rows(n, step_h=8, rate=lambda k: 0.0001, start=T0):
+    return [[start + k * step_h * H, rate(k)] for k in range(n)]
 
 
 # ------------------------------------------------------------------ conversões e leitura
-def test_funding_conversion_matches_hyperliquid_baseline():
-    assert funding_8h_pct(0.0000125) == pytest.approx(0.01)  # 0.01% por 8h = a taxa de juro base
-    assert funding_8h_pct(-0.00005) == pytest.approx(-0.04)
+def test_funding_units():
+    assert funding_8h_pct(0.0000125, 1.0) == pytest.approx(0.01)  # Hyperliquid: 0.01%/8h = taxa de juro base
+    assert funding_8h_pct(0.0001, 8.0) == pytest.approx(0.01)  # Binance normal: 0.01%/8h
+    assert funding_8h_pct(0.00005, 4.0) == pytest.approx(0.01)  # intervalo de 4h
+    assert funding_8h_pct(-0.0005, 8.0) == pytest.approx(-0.05)
 
 
 @pytest.mark.parametrize("px,oi,expected", [
@@ -47,244 +42,213 @@ def test_interpret_without_data():
     assert interpret(None, 1.0) is None and interpret(1.0, None) is None
 
 
-# ------------------------------------------------------------------ monitor
-def test_refresh_is_cached_and_samples_every_five_minutes():
-    clock = Clock()
-    calls = []
-    m = monitor(clock, fetch=lambda: calls.append(1) or ctx())
-    m.refresh(); m.refresh()
-    assert len(calls) == 1 and len(m.samples) == 1
-    clock.t += SAMPLE_EVERY_S + 1
-    m.refresh()
-    assert len(calls) == 2 and len(m.samples) == 2
-    m.refresh(force=True)  # força chamada mas não duplica a amostra
-    assert len(calls) == 3 and len(m.samples) == 2
+# ------------------------------------------------------------------ funding_features
+def test_funding_percentile_and_units():
+    rows = funding_rows(60, rate=lambda k: 0.0001 + k * 1e-6)  # funding sempre a subir
+    idx = bars("2026-03-10 00:00", 96)  # 9 dias depois do início: já há >20 registos
+    f = funding_features(rows, idx, 15, 30.0)
+    close = idx[-1] + pd.Timedelta(minutes=15)
+    known = [k for k, r in enumerate(rows) if pd.Timestamp(r[0], unit="ms", tz="UTC") <= close][-1]
+    assert f["funding_8h_pct"].iloc[-1] == pytest.approx((0.0001 + known * 1e-6) * 100)
+    assert f["funding_pctl"].iloc[-1] == 100.0  # é o mais alto de todos os registos da janela
 
 
-def test_old_samples_are_pruned():
-    clock = Clock()
-    m = monitor(clock)
-    m.refresh()
-    clock.t += KEEP_S + 600
-    m.refresh()
-    assert len(m.samples) == 1 and m.samples[0][0] == clock.t
+def test_percentile_is_nan_until_enough_history():
+    rows = funding_rows(60)  # taxa constante
+    f = funding_features(rows, bars("2026-03-01 00:00", 96 * 8), 15, 30.0, min_records=20)
+    # o 20º registo (k=19) é das 08:00 do dia 7; a barra das 07:45 fecha exatamente aí
+    assert f["funding_pctl"].first_valid_index() == pd.Timestamp("2026-03-07 07:45", tz="UTC")
+    assert f["funding_pctl"].dropna().eq(100.0).all()  # sem variação, todos empatam (<=): percentil 100
 
 
-def test_oi_change_from_own_samples():
-    clock = Clock()
-    oi = {"v": 100.0}
-    m = monitor(clock, fetch=lambda: ctx(oi=oi["v"]))
-    m.refresh()
-    assert m.oi_change_pct(1.0) == (None, None)  # ainda sem histórico
-    for minutes, value in ((30, 101.0), (60, 102.0)):
-        clock.t = 1_700_000_000.0 + minutes * 60
-        oi["v"] = value
-        m.refresh(force=True)
-    pct, src = m.oi_change_pct(1.0)
-    assert src == "hl" and pct == pytest.approx(2.0)
-    assert m.oi_change_pct(4.0) == (None, None)  # não há 4h de amostras
+def test_percentile_of_an_intermediate_value():
+    cycle = [0.0002, 0.0003, 0.0001]
+    rows = funding_rows(41, rate=lambda k: cycle[k % 3] if k < 40 else 0.00025)
+    f = funding_features(rows, bars("2026-03-15 08:00", 4), 15, 30.0)
+    # dos 41 registos da janela, 28 são <= 0.00025 (14 x 0.0002, 13 x 0.0001 e ele próprio)
+    assert f["funding_pctl"].iloc[-1] == pytest.approx(28 / 41 * 100)
 
 
-def test_oi_change_needs_a_sample_near_the_target_time():
-    clock = Clock()
-    m = monitor(clock)
-    m.samples = [[clock.t - 2 * H, 100.0, 50.0], [clock.t, 110.0, 50.0]]
-    assert m.oi_change_pct(1.0) == (None, None)  # a amostra mais próxima está a 1h de distância do alvo
-    assert m.oi_change_pct(2.0)[0] == pytest.approx(10.0)
+def test_interval_change_is_normalised_to_8h():
+    rows = funding_rows(30, 8) + funding_rows(30, 4, start=T0 + 30 * 8 * H)  # passa de 8h para 4h a meio
+    idx = bars("2026-03-01 00:00", 96 * 22)
+    f = funding_features(rows, idx, 15, 30.0)
+    at = lambda ts: f.loc[pd.Timestamp(ts, tz="UTC"), "funding_8h_pct"]
+    assert at("2026-03-05 00:00") == pytest.approx(0.01)  # intervalo de 8h: 0.0001 -> 0.01%/8h
+    assert at("2026-03-20 00:00") == pytest.approx(0.02)  # intervalo de 4h: o dobro por 8h
 
 
-def test_failures_never_raise_and_are_reported():
-    clock = Clock()
-
-    def boom():
-        raise RuntimeError("HTTP 500")
-
-    m = monitor(clock, fetch=boom)
-    assert m.refresh() is None and m.snapshot() is None and "500" in m.last_error
-
-
-def test_snapshot_contents():
-    clock = Clock()
-    m = monitor(clock, fetch=lambda: ctx(oi=2_000_000, mark=50.0, funding=0.00005))
-    m.samples = [[clock.t - H, 1_960_000.0, 50.0]]
-    s = m.snapshot(price_change_1h_pct=1.2)
-    assert s["funding_8h_pct"] == pytest.approx(0.04) and s["oi_usd"] == pytest.approx(100e6)
-    assert s["oi_change_1h_pct"] == pytest.approx((2_000_000 / 1_960_000 - 1) * 100) and s["oi_source"] == "hl"
-    assert s["oi_change_4h_pct"] is None and s["max_leverage"] == 5.0
-    assert s["oi_change_pct"] == s["oi_change_1h_pct"] and "entram longs" in s["reading"]
-
-
-# ------------------------------------------------------------------ Coinalyze (respostas simuladas)
-def oi_payload(start_s, n, step=900, first=1000.0, inc=1.0):
-    return [{"symbol": "ZEC.H", "history": [
-        {"t": start_s + i * step, "o": first + i * inc, "h": first + i * inc, "l": first + i * inc,
-         "c": first + i * inc} for i in range(n)]}]
-
-
-def make_getter(routes):
-    calls = []
-
-    def getter(path, params):
-        calls.append((path, params))
-        return routes[path]
-
-    getter.calls = calls
-    return getter
-
-
-def test_coinalyze_resolves_hyperliquid_symbol():
-    g = make_getter({
-        "/exchanges": [{"name": "Binance", "code": "A"}, {"name": "Hyperliquid", "code": "H"}],
-        "/future-markets": [
-            {"symbol": "ZECUSDT_PERP.A", "exchange": "A", "base_asset": "ZEC", "is_perpetual": True},
-            {"symbol": "BTCUSD_PERP.H", "exchange": "H", "base_asset": "BTC", "is_perpetual": True},
-            {"symbol": "ZEC.H", "exchange": "H", "base_asset": "ZEC", "is_perpetual": True},
-        ]})
-    c = Coinalyze("k", coin="zec", getter=g)
-    assert c.resolve_symbol() == "ZEC.H" and c.resolve_symbol() == "ZEC.H"
-    assert len(g.calls) == 2  # resolvido uma vez só
-
-
-def test_coinalyze_symbol_override_and_missing_market():
-    g = make_getter({})
-    assert Coinalyze("k", symbol="MYSYM", getter=g).resolve_symbol() == "MYSYM" and not g.calls
-    with pytest.raises(CoinalyzeError, match="Hyperliquid"):
-        Coinalyze("k", getter=make_getter({"/exchanges": [{"name": "Binance", "code": "A"}]})).resolve_symbol()
-    with pytest.raises(CoinalyzeError, match="COINALYZE_SYMBOL"):
-        Coinalyze("k", getter=make_getter({"/exchanges": [{"name": "Hyperliquid", "code": "H"}],
-                                           "/future-markets": []})).resolve_symbol()
-
-
-def test_coinalyze_oi_history_parses_seconds_and_milliseconds():
-    t0 = 1_700_000_000
-    for scale in (1, 1000):
-        payload = oi_payload(t0 * scale, 4, step=900 * scale)
-        c = Coinalyze("k", symbol="ZEC.H", getter=make_getter({"/open-interest-history": payload}))
-        df = c.oi_history("15min", hours=1, now=t0 + 3600)
-        assert list(df["c"]) == [1000.0, 1001.0, 1002.0, 1003.0]
-        assert df.index[0] == pd.Timestamp(t0, unit="s", tz="UTC")
-
-
-def test_coinalyze_request_parameters():
-    g = make_getter({"/open-interest-history": oi_payload(1_700_000_000, 2)})
-    Coinalyze("k", symbol="ZEC.H", getter=g).oi_history("15min", hours=6, now=1_700_021_600)
-    path, params = g.calls[0]
-    assert path == "/open-interest-history"
-    assert params == {"symbols": "ZEC.H", "interval": "15min", "from": 1_700_021_600 - 6 * 3600, "to": 1_700_021_600}
-
-
-@pytest.mark.parametrize("payload", [[], [{"symbol": "x", "history": []}], {"error": 1}, [{"symbol": "x"}]])
-def test_coinalyze_bad_payloads(payload):
-    c = Coinalyze("k", symbol="ZEC.H", getter=make_getter({"/open-interest-history": payload}))
-    with pytest.raises(CoinalyzeError):
-        c.oi_history()
-
-
-class FakeResp:
-    def __init__(self, status, body=None, headers=None):
-        self.status_code, self._body, self.headers = status, body, headers or {}
-
-    def json(self):
-        return self._body
-
-
-def test_coinalyze_http_layer(monkeypatch):
-    sent = {}
-
-    def fake_get(url, params=None, headers=None, timeout=None):
-        sent.update(url=url, params=params, headers=headers)
-        return FakeResp(200, [{"ok": 1}])
-
-    monkeypatch.setattr(cz_mod.requests, "get", fake_get)
-    assert Coinalyze("secret")._http_get("/exchanges", {}) == [{"ok": 1}]
-    assert sent["url"] == "https://api.coinalyze.net/v1/exchanges" and sent["headers"] == {"api_key": "secret"}
-
-    monkeypatch.setattr(cz_mod.requests, "get", lambda *a, **k: FakeResp(429, headers={"Retry-After": "12"}))
-    with pytest.raises(CoinalyzeError, match="12s"):
-        Coinalyze("k")._http_get("/x", {})
-    monkeypatch.setattr(cz_mod.requests, "get", lambda *a, **k: FakeResp(401))
-    with pytest.raises(CoinalyzeError, match="chave"):
-        Coinalyze("k")._http_get("/x", {})
-
-
-def test_monitor_falls_back_to_coinalyze_and_survives_its_errors():
-    clock = Clock()
-    t0 = int(clock.t) - 3 * 3600
-    g = make_getter({"/open-interest-history": oi_payload(t0, 13, first=1000.0, inc=10.0)})  # 3h de barras de 15m
-    m = monitor(clock, coinalyze=Coinalyze("k", symbol="ZEC.H", getter=g))
-    pct, src = m.oi_change_pct(1.0)
-    assert src == "coinalyze" and pct == pytest.approx((1120 / 1080 - 1) * 100)
-    m.oi_change_pct(4.0)
-    assert len(g.calls) == 1  # cache de 5 minutos
-
-    def boom(path, params):
-        raise CoinalyzeError("coinalyze: HTTP 500")
-
-    m2 = monitor(clock, coinalyze=Coinalyze("k", symbol="ZEC.H", getter=boom))
-    assert m2.oi_change_pct(1.0) == (None, None) and "500" in m2.last_error
-
-
-def test_own_samples_win_over_coinalyze():
-    clock = Clock()
-    g = make_getter({"/open-interest-history": oi_payload(int(clock.t) - 3 * 3600, 13)})
-    m = monitor(clock, coinalyze=Coinalyze("k", symbol="ZEC.H", getter=g))
-    m.samples = [[clock.t - H, 100.0, 50.0], [clock.t, 103.0, 50.0]]
-    assert m.oi_change_pct(1.0) == (pytest.approx(3.0), "hl") and not g.calls
-
-
-# ------------------------------------------------------------------ backtest: alinhamento sem lookahead
-def bars(start="2026-03-01 00:00", n=24):
-    return pd.date_range(start, periods=n, freq="15min", tz="UTC")
-
-
-def test_funding_series_only_uses_records_known_at_bar_close():
+def test_funding_features_only_use_records_known_at_bar_close():
     hour = 3_600_000
     base = int(pd.Timestamp("2026-03-01 00:00", tz="UTC").timestamp() * 1000)
-    rows = [[base + h * hour + 76, (h + 1) * 0.0000125, 0.0] for h in range(6)]  # registo de cada hora, +76 ms
-    s = funding_series(rows, bars(n=24), 15)
-    at = lambda hhmm: s[pd.Timestamp(f"2026-03-01 {hhmm}", tz="UTC")]
-    # barra 00:45 fecha às 01:00:00.000, ANTES do registo das 01:00:00.076 -> ainda vê o das 00:00
-    assert at("00:45") == pytest.approx(funding_8h_pct(1 * 0.0000125))
-    # barra 01:00 fecha às 01:15 -> já vê o das 01:00
-    assert at("01:00") == pytest.approx(funding_8h_pct(2 * 0.0000125))
-    assert at("00:00") == pytest.approx(funding_8h_pct(1 * 0.0000125))  # fecha às 00:15, vê o das 00:00
+    rows = [[base + h * 8 * hour + 76, 0.0001 * (h + 1)] for h in range(30)]  # registo a 00:00:00.076, 08:00:00.076...
+    idx = bars("2026-03-08 07:00", 8)
+    f = funding_features(rows, idx, 15, 30.0, min_records=1)["funding_8h_pct"]
+    t = lambda hhmm: pd.Timestamp(f"2026-03-08 {hhmm}", tz="UTC")
+    # a barra 07:45 fecha às 08:00:00.000, ANTES do registo das 08:00:00.076 -> ainda vê o das 00:00
+    assert f[t("07:45")] == pytest.approx(0.0001 * 22 * 100)
+    assert f[t("08:00")] == pytest.approx(0.0001 * 23 * 100)  # fecha às 08:15 -> já vê o das 08:00
 
 
-def test_funding_series_is_nan_before_the_first_record_and_when_empty():
-    base = int(pd.Timestamp("2026-03-01 02:00", tz="UTC").timestamp() * 1000)
-    s = funding_series([[base, 0.00001, 0.0]], bars(n=16), 15)
-    assert s.iloc[:7].isna().all() and s.iloc[8:].notna().all()
-    assert funding_series([], bars(n=4), 15).isna().all()
+def test_funding_features_do_not_change_when_future_records_change():
+    rows = funding_rows(80, rate=lambda k: 0.0001 + (k % 7) * 1e-5)
+    idx = bars("2026-03-12 00:00", 96)
+    cut = int(pd.Timestamp("2026-03-12 12:00", tz="UTC").timestamp() * 1000)
+    tampered = [r if r[0] <= cut else [r[0], 0.5] for r in rows]  # futuro absurdo
+    a, b = funding_features(rows, idx, 15, 30.0), funding_features(tampered, idx, 15, 30.0)
+    upto = pd.Timestamp("2026-03-12 11:45", tz="UTC")  # barras que fecham antes de 12:00
+    pd.testing.assert_frame_equal(a[:upto], b[:upto])
 
 
-def make_oi(start="2026-03-01 00:00", n=16):
-    idx = pd.date_range(start, periods=n, freq="15min", tz="UTC")
-    c = pd.Series(1000.0 + np.arange(n) * 10.0, index=idx)
-    return pd.DataFrame({"o": c, "h": c, "l": c, "c": c})
+def test_percentile_window_forgets_old_extremes():
+    rows = funding_rows(150, rate=lambda k: 0.05 if k == 0 else 0.0001)  # um extremo enorme no dia 0
+    rows.append([rows[-1][0] + 8 * H, 0.00015])  # depois de 50 dias: ligeiramente acima do "normal"
+    idx = pd.DatetimeIndex([pd.Timestamp(rows[-1][0], unit="ms", tz="UTC") + pd.Timedelta(minutes=15)])
+    f = funding_features(rows, idx, 15, 30.0)
+    assert f["funding_pctl"].iloc[0] == 100.0  # o extremo do dia 0 já saiu da janela de 30 dias
 
 
-def test_oi_change_series_alignment_and_coverage():
-    oi = make_oi(n=16)  # 00:00 .. 03:45
-    idx = bars("2026-03-01 00:00", 24)  # as barras de preço vão além do histórico de OI
-    s = oi_change_series(oi, idx, 15, hours=1.0)
+def test_no_funding_rows_gives_nan():
+    f = funding_features([], bars(n=4), 15)
+    assert list(f.columns) == ["funding_8h_pct", "funding_pctl"] and f.isna().all().all()
+
+
+# ------------------------------------------------------------------ oi_change_series
+def oi_rows_15m(start, n, first=1000.0, inc=10.0):
+    return [[start + k * M15, first + k * inc, (first + k * inc) * 50] for k in range(n)]
+
+
+def test_oi_change_alignment_and_coverage():
+    s0 = int(pd.Timestamp("2026-03-01 00:00", tz="UTC").timestamp() * 1000)
+    rows = oi_rows_15m(s0, 16)  # 00:00 .. 03:45
+    idx = bars("2026-03-01 00:00", 24)
+    s = oi_change_series(rows, idx, 15, hours=1.0)
     t = lambda hhmm: pd.Timestamp(f"2026-03-01 {hhmm}", tz="UTC")
-    assert s[:t("00:45")].isna().all()  # sem 1h de histórico
-    assert s[t("01:00")] == pytest.approx((1040 / 1000 - 1) * 100)  # c[01:00] / c[00:00]
+    assert s[:t("00:45")].isna().all()  # ainda sem 1h de histórico
+    assert s[t("01:00")] == pytest.approx((1040 / 1000 - 1) * 100)  # valor das 01:00 vs o das 00:00
     assert s[t("03:45")] == pytest.approx((1150 / 1110 - 1) * 100)
-    assert s[t("04:00"):].isna().all()  # depois do último dado não inventa nada
+    # o último valor (03:45) só fica disponível às 04:00; tolera-se 2 períodos de atraso (até ao fecho das 04:30)
+    assert s[t("04:15")] == pytest.approx((1150 / 1130 - 1) * 100)
+    assert s[t("04:30"):].isna().all()  # mais atrasado que isso: não inventa nada
 
 
-def test_oi_change_series_does_not_look_ahead():
-    oi = make_oi(n=16)
+def test_oi_change_does_not_look_ahead():
+    s0 = int(pd.Timestamp("2026-03-01 00:00", tz="UTC").timestamp() * 1000)
+    rows = oi_rows_15m(s0, 16)
     idx = bars("2026-03-01 00:00", 16)
-    a = oi_change_series(oi, idx, 15, 1.0)
-    tampered = oi.copy()
-    tampered.loc[tampered.index > pd.Timestamp("2026-03-01 02:00", tz="UTC"), "c"] *= 5  # mexe só no futuro
-    b = oi_change_series(tampered, idx, 15, 1.0)
-    upto = pd.Timestamp("2026-03-01 02:00", tz="UTC")
+    cutoff = s0 + 2 * H
+    tampered = [r if r[0] <= cutoff else [r[0], r[1] * 5, r[2]] for r in rows]
+    a, b = oi_change_series(rows, idx, 15, 1.0), oi_change_series(tampered, idx, 15, 1.0)
+    upto = pd.Timestamp("2026-03-01 01:45", tz="UTC")  # barras que fecham antes de o valor alterado existir
     pd.testing.assert_series_equal(a[:upto], b[:upto])
 
 
-def test_oi_series_only_supports_15m():
-    with pytest.raises(ValueError):
-        oi_change_series(make_oi(), bars(), 5, 1.0)
+def test_oi_change_without_rows_is_nan():
+    assert oi_change_series([], bars(n=4), 15, 1.0).isna().all()
+
+
+def test_build_frame_columns_and_values():
+    cfg = Config(oi_lookback_hours=1.0, rev_oi_hours=2.0)
+    s0 = int(pd.Timestamp("2026-03-10 00:00", tz="UTC").timestamp() * 1000)
+    fr = build_frame(bars("2026-03-10 06:00", 12), funding_rows(60), oi_rows_15m(s0, 96), cfg, 30.0)
+    assert list(fr.columns) == ["funding_8h_pct", "funding_pctl", "oi_change_pct", "oi_rev_pct"]
+    last = fr.iloc[-1]  # barra das 08:45, fecha às 09:00
+    assert last["oi_change_pct"] == pytest.approx((1350 / 1310 - 1) * 100)  # valor das 08:45 vs o das 07:45
+    assert last["oi_rev_pct"] == pytest.approx((1350 / 1270 - 1) * 100)  # janela de 2h (REV_OI_HOURS)
+    assert last["funding_8h_pct"] == pytest.approx(0.01) and last["funding_pctl"] == 100.0
+
+
+# ------------------------------------------------------------------ DerivsMonitor (Binance simulada)
+NOW = 1_780_000_000.0
+
+
+def monitor(fake=None, venue=None, **cfg):
+    clock = Clock(NOW)
+    fake = fake or FakeBinance(NOW)
+    v = venue if venue is not None else (lambda: {"funding_hr": 0.0000125, "max_leverage": 5.0})
+    return DerivsMonitor(Config(**cfg), binance=fake, venue=v, now=clock), fake, clock
+
+
+def index_at(now=NOW, n=4):
+    end = pd.Timestamp(now, unit="s", tz="UTC").floor("15min")
+    return pd.date_range(end=end - pd.Timedelta(minutes=15), periods=n, freq="15min")
+
+
+def test_frame_builds_features_and_caches():
+    m, fake, clock = monitor()
+    fr = m.frame(index_at())
+    assert fr is not None and fr["funding_pctl"].notna().all() and fr["oi_rev_pct"].notna().all()
+    m.frame(index_at())
+    assert fake.calls["funding"] == 1 and fake.calls["oi_hist"] == 1  # a 2ª chamada usou a cache
+    clock.t += OI_TTL_S + 1
+    m.frame(index_at(clock.t))
+    assert fake.calls["oi_hist"] == 2 and fake.calls["funding"] == 1  # o OI renova depressa; o funding não
+    clock.t += FUNDING_TTL_S
+    m.frame(index_at(clock.t))
+    assert fake.calls["funding"] == 2
+
+
+def test_frame_is_none_without_funding_and_recovers():
+    fake = FakeBinance(NOW)
+    fake.fail.add("funding")
+    m, _, _ = monitor(fake)
+    assert m.frame(index_at()) is None and "funding em baixo" in m.last_error
+    fake.fail.clear()
+    assert m.frame(index_at()) is not None
+
+
+def test_stale_funding_cache_is_used_for_a_while_then_dropped():
+    fake = FakeBinance(NOW)
+    m, _, clock = monitor(fake)
+    assert m.frame(index_at()) is not None
+    fake.fail.add("funding")
+    clock.t += FUNDING_TTL_S + 60  # cache expirada mas com <6h: o funding muda devagar, ainda serve
+    assert m.frame(index_at(clock.t)) is not None
+    clock.t += STALE_FUNDING_S  # agora com >6h sem atualizar: já não
+    assert m.frame(index_at(clock.t)) is None
+
+
+def test_oi_failure_keeps_funding_features():
+    fake = FakeBinance(NOW)
+    fake.fail.add("oi_hist")
+    m, _, _ = monitor(fake)
+    fr = m.frame(index_at())
+    assert fr is not None and fr["funding_pctl"].notna().all() and fr["oi_rev_pct"].isna().all()
+
+
+def test_snapshot_numbers():
+    m, fake, _ = monitor(FakeBinance(NOW, funding_last=0.0003, mark=50.0, index=49.9, oi_now=2000.0))
+    s = m.snapshot(price_change_1h_pct=1.2)
+    assert s["funding_8h_pct"] == pytest.approx(0.03)  # 0.0003 por 8h
+    assert s["premium_pct"] == pytest.approx((50.0 / 49.9 - 1) * 100)
+    assert s["oi_coins"] == 2000.0 and s["oi_usd"] == pytest.approx(100_000.0)
+    # 1h: último valor de OI já disponível há 1h = linha k=379 (1379); 2000/1379 - 1
+    assert s["oi_change_1h_pct"] == pytest.approx((2000 / 1379 - 1) * 100)
+    assert s["oi_change_4h_pct"] == pytest.approx((2000 / (1000 + 384 - 17) - 1) * 100)
+    assert s["oi_rev_pct"] == pytest.approx((2000 / (1000 + 384 - 97) - 1) * 100)  # 24h
+    assert s["hl_funding_8h_pct"] == pytest.approx(0.01) and s["max_leverage"] == 5.0
+    assert "entram longs" in s["reading"] and s["source"] == "binance"
+
+
+def test_snapshot_uses_the_real_funding_interval():
+    m, _, _ = monitor(FakeBinance(NOW, step_h=4, funding_last=0.0001))
+    assert m.snapshot()["funding_8h_pct"] == pytest.approx(0.02)  # 0.0001 por 4h = 0.02%/8h
+
+
+def test_snapshot_passes_the_percentile_through():
+    m, _, _ = monitor()
+    row = pd.Series({"funding_pctl": 96.4, "funding_8h_pct": 0.05})
+    assert m.snapshot(frame_row=row)["funding_pctl"] == 96.4
+    assert m.snapshot(frame_row=pd.Series({"funding_pctl": np.nan}))["funding_pctl"] is None
+    assert m.snapshot()["funding_pctl"] is None
+
+
+def test_snapshot_survives_a_dead_hyperliquid_but_not_a_dead_binance():
+    def boom():
+        raise RuntimeError("HL em baixo")
+
+    m, fake, _ = monitor(venue=boom)
+    s = m.snapshot()
+    assert s is not None and s["hl_funding_8h_pct"] is None and s["max_leverage"] == 0.0
+    fake.fail.add("premium")
+    assert m.snapshot() is None and "premium" in m.last_error

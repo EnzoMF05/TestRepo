@@ -1,7 +1,7 @@
 """Formatação das mensagens do Telegram (HTML)."""
 from __future__ import annotations
 
-from datetime import datetime
+import html
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -37,16 +37,20 @@ def _signed(x: float | None, unit: str = "%") -> str:
 
 
 def derivs_lines(deriv: dict | None, side: str, cfg: Config) -> str:
-    """Linhas de contexto de funding/OI (vazio se não houver dados)."""
+    """Linhas de contexto de funding/OI da Binance (vazio se não houver dados)."""
     if not deriv:
         return ""
     f8 = deriv["funding_8h_pct"]
     pays = "longs pagam" if f8 > 0 else "shorts pagam" if f8 < 0 else "neutro"
-    src = {"hl": "", "coinalyze": " (Coinalyze)"}.get(deriv.get("oi_source"), "")
+    pctl = deriv.get("funding_pctl")
+    pctl_txt = "" if pctl is None else f" · P{pctl:.0f} dos últimos {cfg.crowd_window_days:g}d"
+    hl = deriv.get("hl_funding_8h_pct")
+    hl_txt = "" if hl is None else f" · Hyperliquid {hl:+.4f}%/8h"
     lines = [
-        f"Funding: <b>{f8:+.4f}%/8h</b> ({pays}) · prémio {deriv['premium_pct']:+.3f}%",
-        f"OI: <b>{_usd(deriv['oi_usd'])}</b> · 1h {_signed(deriv.get('oi_change_1h_pct'))} · "
-        f"4h {_signed(deriv.get('oi_change_4h_pct'))}{src}",
+        f"Funding Binance: <b>{f8:+.4f}%/8h</b> ({pays}){pctl_txt}{hl_txt}",
+        f"OI Binance: <b>{_usd(deriv['oi_usd'])}</b> · 1h {_signed(deriv.get('oi_change_1h_pct'))} · "
+        f"4h {_signed(deriv.get('oi_change_4h_pct'))} · {cfg.rev_oi_hours:g}h {_signed(deriv.get('oi_rev_pct'))} · "
+        f"prémio {deriv['premium_pct']:+.3f}%",
     ]
     if deriv.get("reading"):
         lines.append(f"Leitura: {deriv['reading']}")
@@ -58,16 +62,33 @@ def derivs_lines(deriv: dict | None, side: str, cfg: Config) -> str:
     return "\n".join(lines) + "\n"
 
 
-def format_signal(t: Trade, cfg: Config, htf: int, rsi: float, adx: float, deriv: dict | None = None) -> str:
+def _why_reversal(t: Trade, info: dict, cfg: Config) -> str:
+    """O porquê de um sinal de reversão, com os números que o dispararam."""
+    up = t.side == "short"  # o excesso foi para cima
+    txt = (f"Porquê: funding {info['funding_8h_pct']:+.3f}%/8h (P{info['funding_pctl']:.0f} dos últimos "
+           f"{cfg.crowd_window_days:g}d) · preço {info['stretch_atr']:.1f} ATR {'acima' if up else 'abaixo'} da EMA55 · "
+           f"RSI {'pico' if up else 'mínimo'} {info['rsi_extreme']:.0f} · candle de rejeição")
+    if cfg.rev_use_oi and info.get("oi_rev_pct") is not None:  # só quando o OI é uma condição do sinal
+        txt += f" · OI {cfg.rev_oi_hours:g}h {info['oi_rev_pct']:+.1f}%"
+    return txt + "\n"
+
+
+def format_signal(t: Trade, cfg: Config, htf: int, rsi: float, adx: float, deriv: dict | None = None,
+                  info: dict | None = None) -> str:
     long_ = t.side == "long"
     icon, word = ("🟢", "LONG") if long_ else ("🔴", "SHORT")
-    kind = "Pullback" if t.kind == "pullback" else "Rutura (breakout)"
+    if t.kind == "reversal":
+        kind = f"Reversão ({'shorts sobrelotados' if long_ else 'longs sobrelotados'})"
+    else:
+        kind = "Pullback" if t.kind == "pullback" else "Rutura (breakout)"
     pct = t.risk / t.entry * 100
     qty, notional, lev = position_size(cfg, t.entry, t.risk)
     rr1 = abs(t.tp1 - t.entry) / t.risk
     rr2 = abs(t.tp2 - t.entry) / t.risk
     chase = t.entry + t.d * 0.3 * t.risk  # limite para não perseguir o preço
-    trend = "alta" if htf > 0 else "baixa"
+    trend = "alta" if htf > 0 else "baixa" if htf < 0 else "neutra"
+    counter = " (contra-tendência)" if htf * t.d < 0 else ""
+    why = _why_reversal(t, info, cfg) if t.kind == "reversal" and info else ""
     return (
         f"{icon} <b>{cfg.base} {word}</b> — {kind} ({cfg.interval_str})\n"
         f"<i>{_local(t.open_time, cfg, cfg.interval_min)}</i>\n\n"
@@ -78,7 +99,8 @@ def format_signal(t: Trade, cfg: Config, htf: int, rsi: float, adx: float, deriv
         f"Tamanho (risco {cfg.risk_pct:g}% de {cfg.account_size:,.0f}$): "
         f"{qty:.2f} {cfg.base} ≈ {notional:,.0f}$ (~{lev:.1f}x)\n"
         f"{_leverage_warning(lev, deriv)}"
-        f"Contexto: 1h em {trend} · ADX {adx:.0f} · RSI {rsi:.0f}\n"
+        f"{why}"
+        f"Contexto: 1h em {trend}{counter} · ADX {adx:.0f} · RSI {rsi:.0f}\n"
         f"{derivs_lines(deriv, t.side, cfg)}"
         f"Não entrar se o preço já passou {_px(chase)}. Saída a mercado após {cfg.max_hold_bars * cfg.interval_min // 60}h."
     )
@@ -104,7 +126,8 @@ def format_event(ev: Event, cfg: Config) -> str | None:
                 f"Resultado: <b>{t.r_net:+.2f}R</b> (já com comissões/derrapagem)")
     if ev.kind == "blocked":
         d = ev.data
-        return f"🚫 Setup {d['side'].upper()} ({d['kind']}) ignorado pelos filtros: {d['reason']}"
+        return (f"🚫 Setup {d['side'].upper()} ({d['kind']}) ignorado pelos filtros: "
+                f"{html.escape(d['reason'], quote=False)}")
     if ev.kind == "daily_stop":
         return (f"⛔ Limite diário atingido ({ev.data['day_r']:+.1f}R). "
                 f"Sem mais sinais até às 00:00 UTC.")

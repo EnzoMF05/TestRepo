@@ -1,10 +1,12 @@
 """Backtest da estratégia com o MESMO motor do robô live.
 
-    python -m zec_bot.backtest                      # Hyperliquid: só guarda as últimas 5000 barras (~52 dias)
+    python -m zec_bot.backtest                      # candles da Hyperliquid: só ~52 dias
     python -m zec_bot.backtest --days 365 --exchange binance --save-csv zec_15m.csv   # histórico longo (proxy)
-    python -m zec_bot.backtest --csv zec_15m.csv --side long
-    python -m zec_bot.backtest --funding-filter     # compara COM e SEM o filtro de funding (histórico da Hyperliquid)
-    python -m zec_bot.backtest --oi-filter          # idem para OI (precisa de COINALYZE_API_KEY; só ~2-3 semanas)
+    python -m zec_bot.backtest --csv zec_15m.csv --strategy both     # reversão E tendência, separadas por tipo
+    python -m zec_bot.backtest --funding-filter     # compara COM e SEM o filtro de funding (estratégia de tendência)
+
+O funding e o OI vêm da Binance (perp USDT). O funding tem histórico fundo; o OI só ~30 dias, por isso as
+regras que dependem de OI (REV_USE_OI, --oi-filter) só podem ser testadas nesse período.
 
 Como ler os resultados (leitura honesta):
   * R = unidade de risco (1R = distância entrada-stop). Os resultados já incluem comissões e derrapagem.
@@ -15,28 +17,26 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from dataclasses import asdict, replace
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-from . import hl
-from .coinalyze import Coinalyze
+from . import binance_futures as bf
 from .config import Config
 from .data import fetch_exchange
-from .derivs import funding_series, oi_change_series
+from .derivs import build_frame
 from .engine import Engine, summarize
 from .strategy import Params, prepare
 
 
 def run_backtest(df: pd.DataFrame, cfg: Config, params: Params | None = None, deriv: Optional[pd.DataFrame] = None,
                  start: Optional[int] = None, blocked: Optional[list] = None) -> tuple[list[dict], pd.DataFrame]:
-    """`deriv`: DataFrame alinhado com `df` (colunas funding_8h_pct, oi_change_pct) para os filtros.
-    `blocked`: se for dada uma lista, recebe os setups que os filtros bloquearam."""
-    p = params or Params()
-    feat = prepare(df, p)
+    """`deriv`: features de funding/OI alinhadas com `df` (`derivs.build_frame`): alimentam a estratégia de
+    reversão e os filtros. `blocked`: se for dada uma lista, recebe os setups que os filtros bloquearam."""
+    p = params or Params.from_cfg(cfg)
+    feat = prepare(df, p, deriv=deriv)
     engine = Engine(cfg, p)
     trades: list[dict] = []
     first = min(p.warmup_bars, max(len(feat) - 1, 0)) if start is None else start
@@ -54,30 +54,32 @@ def run_backtest(df: pd.DataFrame, cfg: Config, params: Params | None = None, de
 
 
 def build_deriv(index: pd.DatetimeIndex, cfg: Config, need_oi: bool) -> pd.DataFrame:
-    """Funding (histórico da Hyperliquid) e, se pedido, variação de OI (Coinalyze) alinhados com as barras."""
-    start_ms = int(index[0].timestamp() * 1000) - 2 * 3600 * 1000
-    fund = funding_series(hl.fetch_funding_history(cfg.base, start_ms), index, cfg.interval_min)
-    oi = pd.Series(np.nan, index=index)
-    if need_oi:
-        cz = Coinalyze(cfg.coinalyze_api_key, cfg.coinalyze_symbol, cfg.base)
-        if not cz.enabled:
-            raise SystemExit("O filtro de OI precisa de COINALYZE_API_KEY no .env (chave gratuita do Coinalyze).")
-        hours = (index[-1] - index[0]).total_seconds() / 3600 + cfg.oi_lookback_hours + 2
-        oi = oi_change_series(cz.oi_history("15min", hours=hours, now=time.time()), index, cfg.interval_min,
-                              cfg.oi_lookback_hours)
-    return pd.DataFrame({"funding_8h_pct": fund, "oi_change_pct": oi})
+    """Funding (e, se pedido, OI) da Binance alinhados com as barras. Só usa dados conhecidos no fecho de cada barra."""
+    start_ms = int(index[0].timestamp() * 1000) - int((cfg.crowd_window_days + 3) * 86_400_000)
+    try:
+        funding = bf.fetch_funding_history(cfg.derivs_symbol, start_ms)
+        oi = bf.fetch_oi_hist(cfg.derivs_symbol, int(index[0].timestamp() * 1000) - 2 * 86_400_000) if need_oi else []
+    except bf.BinanceError as e:
+        raise SystemExit(f"Não consegui o funding/OI da Binance: {e}")
+    if not funding:
+        raise SystemExit(f"A Binance não devolveu funding para {cfg.derivs_symbol}.")
+    return build_frame(index, funding, oi, cfg, cfg.crowd_window_days)
 
 
 def first_valid_bar(deriv: pd.DataFrame, cfg: Config, floor: int) -> int:
-    """Primeira barra (>= floor) em que existem TODOS os dados exigidos pelos filtros ligados."""
+    """Primeira barra (>= floor) em que existem TODOS os dados exigidos pela configuração."""
     ok = np.ones(len(deriv), dtype=bool)
+    if cfg.strategy in ("reversal", "both"):
+        ok &= deriv["funding_pctl"].notna().to_numpy()
+        if cfg.rev_use_oi:
+            ok &= deriv["oi_rev_pct"].notna().to_numpy()
     if cfg.funding_filter:
         ok &= deriv["funding_8h_pct"].notna().to_numpy()
     if cfg.oi_filter:
         ok &= deriv["oi_change_pct"].notna().to_numpy()
     ok[:floor] = False
     if not ok.any():
-        raise SystemExit("Sem barras com dados de funding/OI para os filtros pedidos.")
+        raise SystemExit("Sem barras com dados de funding/OI para o que pediste (o OI da Binance só cobre ~30 dias).")
     return int(np.argmax(ok))
 
 
@@ -144,7 +146,7 @@ def report(trades: list[dict], feat: pd.DataFrame, cfg: Config) -> str:
     out.append(f"≈ {sum(rs) * cfg.risk_pct:+.1f}% da conta a {cfg.risk_pct:g}% de risco/trade (sem compor)")
     out.append("")
     out.append("— Por tipo / lado —")
-    for label, key, vals in (("setup", "kind", ("pullback", "breakout")), ("lado", "side", ("long", "short"))):
+    for label, key, vals in (("setup", "kind", ("reversal", "pullback", "breakout")), ("lado", "side", ("long", "short"))):
         for v in vals:
             sub = [t for t in trades if t[key] == v]
             if sub:
@@ -179,15 +181,19 @@ def main() -> int:
     ap.add_argument("--exchange", default=None, help="hyperliquid (~52 dias) | binance | bybit | okx (histórico longo)")
     ap.add_argument("--csv", help="usa um CSV guardado em vez de ir à exchange")
     ap.add_argument("--save-csv", help="guarda os candles descarregados")
+    ap.add_argument("--strategy", choices=["reversal", "trend", "both"])
     ap.add_argument("--side", choices=["long", "short", "both"])
     ap.add_argument("--fee", type=float, help="comissão por lado, em %%")
     ap.add_argument("--slippage", type=float, help="derrapagem por lado, em %%")
-    ap.add_argument("--funding-filter", action="store_true", help="compara com/sem o filtro de funding")
-    ap.add_argument("--oi-filter", action="store_true", help="compara com/sem o filtro de OI (Coinalyze)")
+    ap.add_argument("--funding-filter", action="store_true", help="compara com/sem o filtro de funding (tendência)")
+    ap.add_argument("--oi-filter", action="store_true", help="compara com/sem o filtro de OI (tendência)")
+    ap.add_argument("--use-oi", action="store_true", help="a reversão exige também OI a subir (só ~30 dias de dados)")
     ap.add_argument("--trades-csv", default="zec_backtest_trades.csv")
     args = ap.parse_args()
 
     cfg = Config.from_env()
+    if args.strategy:
+        cfg.strategy = args.strategy
     if args.side:
         cfg.side = args.side
     if args.fee is not None:
@@ -196,7 +202,8 @@ def main() -> int:
         cfg.slippage_pct = args.slippage
     cfg.funding_filter = cfg.funding_filter or args.funding_filter
     cfg.oi_filter = cfg.oi_filter or args.oi_filter
-    p = Params()
+    cfg.rev_use_oi = cfg.rev_use_oi or args.use_oi
+    p = Params.from_cfg(cfg)
 
     exchange = args.exchange or cfg.exchange
     if args.csv:
@@ -217,17 +224,22 @@ def main() -> int:
         print(f"Dados insuficientes ({len(df)} barras).")
         return 1
 
-    if cfg.funding_filter or cfg.oi_filter:
-        deriv = build_deriv(df.index, cfg, need_oi=cfg.oi_filter)
+    deriv, start = None, None
+    if cfg.needs_derivs:
+        print(f"A obter funding/OI da Binance ({cfg.derivs_symbol})…")
+        deriv = build_deriv(df.index, cfg, need_oi=cfg.rev_use_oi or cfg.oi_filter)
         start = first_valid_bar(deriv, cfg, p.warmup_bars)
+    print(f"Estratégia: {cfg.strategy} · lado: {cfg.side}")
+
+    if cfg.funding_filter or cfg.oi_filter:
         no_filters = replace(cfg, funding_filter=False, oi_filter=False)
         blocked: list = []
-        base, feat = run_backtest(df, no_filters, p, deriv=deriv, start=start)
+        base, feat = run_backtest(df, no_filters, Params.from_cfg(no_filters), deriv=deriv, start=start)
         trades, _ = run_backtest(df, cfg, p, deriv=deriv, start=start, blocked=blocked)
         print(report(base, feat, no_filters))
         print("\n" + compare(base, trades, blocked, feat))
     else:
-        trades, feat = run_backtest(df, cfg, p)
+        trades, feat = run_backtest(df, cfg, p, deriv=deriv, start=start)
         print(report(trades, feat, cfg))
     if trades:
         pd.DataFrame(trades).to_csv(args.trades_csv, index=False)

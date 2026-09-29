@@ -4,7 +4,6 @@ Formatos (documentação oficial da Hyperliquid, confirmada por fontes secundár
   * candleSnapshot   -> [{"t","T","s","i","o","c","h","l","v","n"}, ...]  (só as ÚLTIMAS 5000 barras)
   * metaAndAssetCtxs -> [ {"universe":[{"name","maxLeverage",...}]}, [ {"funding","openInterest","markPx",
                           "oraclePx","premium","dayNtlVlm",...}, ... ] ]   (mesma ordem nas duas listas)
-  * fundingHistory   -> [{"coin","fundingRate","premium","time"}, ...]      (máx. 500 por chamada)
 
 `funding` é a taxa HORÁRIA (a Hyperliquid cobra funding de hora a hora); `openInterest` está em unidades da moeda.
 """
@@ -83,33 +82,3 @@ def parse_asset_ctx(payload: Any, coin: str) -> dict:
 
 def fetch_asset_ctx(coin: str) -> dict:
     return parse_asset_ctx(post_info({"type": "metaAndAssetCtxs"}), coin)
-
-
-def parse_funding(payload: Any) -> list[list]:
-    if not isinstance(payload, list):
-        raise HLError(f"hyperliquid: resposta inesperada ({str(payload)[:80]})")
-    try:
-        return sorted(([int(r["time"]), float(r["fundingRate"]), float(r.get("premium") or 0.0)] for r in payload),
-                      key=lambda r: r[0])
-    except (KeyError, TypeError, ValueError) as e:
-        raise HLError(f"hyperliquid: fundingHistory com formato inesperado ({e!r})") from e
-
-
-def fetch_funding_history(coin: str, start_ms: int, end_ms: Optional[int] = None, max_pages: int = 100) -> list[list]:
-    """[time_ms, taxa_horária, prémio] ascendente, paginando de 500 em 500."""
-    out: list[list] = []
-    cursor = start_ms
-    for _ in range(max_pages):
-        payload = {"type": "fundingHistory", "coin": coin, "startTime": cursor}
-        if end_ms:
-            payload["endTime"] = end_ms
-        page = parse_funding(post_info(payload))
-        if not page:
-            break
-        out += page
-        if len(page) < 500:
-            break
-        cursor = page[-1][0] + 1
-        time.sleep(0.15)
-    dedup = {r[0]: r for r in out}
-    return [dedup[k] for k in sorted(dedup)]

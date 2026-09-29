@@ -1,6 +1,7 @@
 """Loop principal do robô: vai buscar candles, corre a estratégia e envia sinais para o Telegram."""
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -36,7 +37,7 @@ class Bot:
         derivs: DerivsMonitor | None = None,
     ):
         self.cfg = cfg
-        self.p = params or Params()
+        self.p = params or Params.from_cfg(cfg)
         self.engine = Engine(cfg, self.p)
         self.tg = tg or Telegram(cfg.telegram_token, cfg.telegram_chat_id)
         self.fetch = fetch or (
@@ -49,6 +50,7 @@ class Bot:
         self.last_price = 0.0
         self.failures = 0
         self.down_alerted = False
+        self.derivs_down = False
         self._load_state()
 
     # ------------------------------------------------------------------ estado
@@ -58,7 +60,6 @@ class Bot:
             try:
                 saved = json.loads(path.read_text(encoding="utf-8"))
                 self.engine.load(saved)
-                self.derivs.samples = [list(map(float, x)) for x in saved.get("derivs_samples", [])]
                 log.info("Estado carregado de %s (%d trades no histórico)", path, len(self.engine.closed))
             except (ValueError, KeyError, TypeError) as e:
                 log.error("Ficheiro de estado inválido (%s) — a começar do zero. Cópia em .bak", e)
@@ -67,9 +68,7 @@ class Bot:
     def _save_state(self) -> None:
         path = Path(self.cfg.state_file)
         tmp = path.with_suffix(".tmp")
-        state = self.engine.to_dict()
-        state["derivs_samples"] = self.derivs.samples  # histórico próprio de OI, sobrevive a reinícios
-        tmp.write_text(json.dumps(state), encoding="utf-8")
+        tmp.write_text(json.dumps(self.engine.to_dict()), encoding="utf-8")
         os.replace(tmp, path)  # escrita atómica: nunca deixa o ficheiro a meio
 
     # ------------------------------------------------------------------ ciclo
@@ -84,14 +83,36 @@ class Bot:
             if text:
                 self.tg.send(text)
 
+    def _derivs_frame(self, index: pd.DatetimeIndex) -> pd.DataFrame | None:
+        """Features de funding/OI da Binance por barra, com aviso se deixarem de estar disponíveis."""
+        if not self.cfg.needs_derivs:
+            return None
+        frame = self.derivs.frame(index)
+        if frame is None and not self.derivs_down:
+            self.derivs_down = True
+            what = "sinais de REVERSÃO desativados" if self.cfg.strategy != "trend" else "filtros de funding/OI desativados"
+            self.tg.send(f"⚠️ Sem funding/OI da Binance ({html.escape(self.derivs.last_error, quote=False)}): "
+                         f"{what} até voltarem.")
+        elif frame is not None and self.derivs_down:
+            self.derivs_down = False
+            self.tg.send("✅ Funding/OI da Binance recuperados.")
+        return frame
+
+    @staticmethod
+    def _frame_row(frame: pd.DataFrame | None, i: int) -> dict | None:
+        if frame is None:
+            return None
+        r = frame.iloc[i]
+        return {"funding_8h_pct": r["funding_8h_pct"], "oi_change_pct": r["oi_change_pct"]}
+
     def cycle(self) -> int:
         """Uma passagem: processa as barras novas. Devolve quantas processou."""
         df, self.exchange = self.fetch()
         if df.empty:
             return 0
         self.last_price = float(df["close"].iloc[-1])
-        feat = prepare(df, self.p)
-        self.derivs.refresh()  # amostra o OI de 5 em 5 min (com cache), mesmo sem barras novas
+        frame = self._derivs_frame(df.index)
+        feat = prepare(df, self.p, deriv=frame)
 
         if self.engine.last_bar:
             todo = [i for i, ts in enumerate(feat.index) if ts > pd.Timestamp(self.engine.last_bar)]
@@ -103,23 +124,23 @@ class Bot:
             closed_at = feat.index[i] + pd.Timedelta(minutes=self.cfg.interval_min)
             fresh = self.now() - closed_at <= MAX_SIGNAL_AGE
             evaluate = i == last_i and fresh
-            deriv = self._deriv_snapshot(feat, i) if evaluate and feat["sig"].iloc[i] != 0 else None
-            self._dispatch(self.engine.on_bar(feat, i, evaluate=evaluate, deriv=deriv), deriv)
+            snap = self._deriv_snapshot(feat, i, frame) if evaluate and feat["sig"].iloc[i] != 0 else None
+            self._dispatch(self.engine.on_bar(feat, i, evaluate=evaluate, deriv=self._frame_row(frame, i)), snap)
         if todo:
             self._save_state()
         return len(todo)
 
-    def _deriv_snapshot(self, feat: pd.DataFrame, i: int) -> dict | None:
-        """Funding/OI para o sinal da barra `i`. Falha silenciosa: são contexto, não podem parar o robô."""
+    def _deriv_snapshot(self, feat: pd.DataFrame, i: int, frame: pd.DataFrame | None = None) -> dict | None:
+        """Números de funding/OI para a mensagem do sinal da barra `i`. Falha silenciosa: é contexto."""
         per_hour = max(60 // self.cfg.interval_min, 1)
         chg = None
         if i >= per_hour:
             chg = (float(feat["close"].iloc[i]) / float(feat["close"].iloc[i - per_hour]) - 1) * 100
-        return self._safe_snapshot(chg)
+        return self._safe_snapshot(chg, None if frame is None else frame.iloc[i])
 
-    def _safe_snapshot(self, price_change_1h_pct: float | None = None) -> dict | None:
+    def _safe_snapshot(self, price_change_1h_pct: float | None = None, frame_row: pd.Series | None = None) -> dict | None:
         try:
-            return self.derivs.snapshot(price_change_1h_pct=price_change_1h_pct)
+            return self.derivs.snapshot(price_change_1h_pct=price_change_1h_pct, frame_row=frame_row)
         except Exception as e:  # noqa: BLE001
             log.warning("Falha ao calcular derivados: %s", e)
             return None
@@ -158,7 +179,8 @@ class Bot:
             log.exception("Erro no ciclo (%d seguidos): %s", self.failures, e)
             if self.failures >= ALERT_AFTER_FAILURES and not self.down_alerted:
                 self.down_alerted = True
-                self.tg.send(f"⚠️ O robô não consegue obter dados há {self.failures} tentativas: {e}")
+                self.tg.send(f"⚠️ O robô não consegue obter dados há {self.failures} tentativas: "
+                             f"{html.escape(str(e), quote=False)}")
         if self.cfg.enable_commands:
             self.handle_commands()
 

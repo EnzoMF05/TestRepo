@@ -98,6 +98,10 @@ def make_feat(n=200, sigs=None, stop_next=True, start="2026-01-01", kind="pullba
     df = pd.DataFrame({"open": 100.0, "high": 100.1, "low": 99.9, "close": 100.0, "volume": 1.0}, index=idx)
     df["sig"], df["kind"], df["risk"] = 0, "", np.nan
     df["atr"], df["rsi"], df["adx"], df["htf"] = 1.0, 50.0, 25.0, 1
+    rev = kind == "reversal"
+    df["tp1_r"], df["tp2_r"] = (1.0, 2.0) if rev else (1.5, 3.0)
+    df["stretch_up"], df["stretch_dn"], df["rsi_hi3"], df["rsi_lo3"] = 3.0, 3.0, 70.0, 30.0
+    df["funding_8h_pct"], df["funding_pctl"], df["oi_rev_pct"] = 0.08, 97.0, np.nan
     for i, s in (sigs or {}).items():
         df.iloc[i, df.columns.get_loc("sig")] = s
         df.iloc[i, df.columns.get_loc("kind")] = kind
@@ -269,3 +273,66 @@ def test_missing_derivs_data_never_blocks(deriv):
     feat = make_feat(n=90, sigs={10: 1}, kind="breakout")
     e = Engine(cfg(funding_filter=True, oi_filter=True))
     assert kinds(one_bar(e, feat, 10, deriv)) == ["signal"]
+
+
+# ------------------------------------------------------------------ reversão: alvos próprios e isenção dos filtros de tendência
+def test_reversal_is_exempt_from_the_trend_filters():
+    """O funding é o GATILHO da reversão, não um filtro: um long de reversão com funding alto não pode ser bloqueado."""
+    feat = make_feat(n=90, sigs={10: 1}, kind="reversal")
+    e = Engine(cfg(funding_filter=True, oi_filter=True))
+    assert kinds(one_bar(e, feat, 10, {"funding_8h_pct": 0.9, "oi_change_pct": -9.0})) == ["signal"]
+    same_for_trend = make_feat(n=90, sigs={10: 1}, kind="breakout")
+    e2 = Engine(cfg(funding_filter=True))
+    assert kinds(one_bar(e2, same_for_trend, 10, {"funding_8h_pct": 0.9})) == ["blocked"]
+
+
+def test_reversal_trade_carries_its_own_targets():
+    feat = make_feat(n=90, sigs={10: 1}, kind="reversal", stop_next=False)
+    e = Engine(cfg())
+    ev = one_bar(e, feat, 10, None)
+    t = ev[0].trade
+    assert (t.tp1_r, t.tp2_r) == (1.0, 2.0)
+    assert (t.tp1, t.tp2) == (pytest.approx(101.0), pytest.approx(102.0))  # entrada 100, risco 1 -> 1R e 2R
+    assert ev[0].data["info"]["funding_pctl"] == 97.0 and ev[0].data["info"]["stretch_atr"] == 3.0
+    trend = Engine(cfg())
+    tt = one_bar(trend, make_feat(n=90, sigs={10: 1}, stop_next=False), 10, None)[0].trade
+    assert (tt.tp1_r, tt.tp2_r) == (1.5, 3.0) and tt.tp1 == pytest.approx(101.5)
+
+
+def rev_trade(side="long", **kw):
+    t = mk(side, **kw)
+    d = t.d
+    t.tp1_r, t.tp2_r = 1.0, 2.0
+    t.tp1, t.tp2 = t.entry + d * 1.0 * t.risk, t.entry + d * 2.0 * t.risk
+    return t
+
+
+def test_reversal_targets_drive_the_r_accounting():
+    t = rev_trade()  # entrada 100, risco 2 -> TP1 102, TP2 104
+    assert step(t, 102.5, 100.5) == ["tp1"] and t.realized_r == pytest.approx(0.5)  # 50% a 1R
+    assert step(t, 104.2, 101) == ["closed"]
+    assert (t.exit_reason, t.r_gross) == ("tp2", pytest.approx(0.5 + 0.5 * 2.0))  # +1.5R no total
+
+    t = rev_trade("short")
+    step(t, 99.5, 97.5)
+    assert step(t, 100.1, 99) == ["closed"] and (t.exit_reason, t.r_gross) == ("breakeven", pytest.approx(0.5))
+
+
+def test_reversal_state_roundtrip_keeps_targets():
+    feat = make_feat(n=90, sigs={10: -1}, kind="reversal", stop_next=False)
+    e = Engine(cfg())
+    one_bar(e, feat, 10, None)
+    e2 = Engine(cfg())
+    e2.load(e.to_dict())
+    assert (e2.trade.tp1_r, e2.trade.tp2_r, e2.trade.kind) == (1.0, 2.0, "reversal")
+
+
+def test_old_state_without_target_fields_loads_with_trend_defaults():
+    feat = make_feat(n=90, sigs={10: 1}, stop_next=False)
+    e = Engine(cfg())
+    one_bar(e, feat, 10, None)
+    old = e.to_dict()
+    del old["trade"]["tp1_r"], old["trade"]["tp2_r"]  # estado gravado por uma versão anterior
+    e2 = Engine(cfg())
+    e2.load(old)
+    assert (e2.trade.tp1_r, e2.trade.tp2_r) == (1.5, 3.0)

@@ -1,52 +1,80 @@
-# ZEC day-trading bot (sinais no Telegram)
+# ZEC day-trading bot (sinais de reversão no Telegram)
 
-Robô em Python que vigia o **ZEC perp na Hyperliquid** e te manda sinais de day trading para o **Telegram**,
-com o **funding** e o **open interest** de cada momento. **Só emite sinais — não executa ordens** e não
-precisa de chaves de API (usa a API pública e gratuita da Hyperliquid; o Coinalyze é opcional).
-Acompanha cada sinal como um trade virtual e avisa quando toca no TP1, no TP2 ou no stop.
+Robô em Python que vigia o **ZEC perp na Hyperliquid** e te manda para o **Telegram** sinais de day trading
+de **reversão**: contra o excesso, quando o mercado está **carregado** de um lado (funding e open interest da
+Binance) e o preço está **caro/barato**. **Só emite sinais — não executa ordens** e não precisa de chaves de API
+(usa dados públicos da Hyperliquid e da Binance). Acompanha cada sinal como um trade virtual e avisa quando
+toca no TP1, no TP2 ou no stop.
 
 > ⚠️ **Lê a secção [Limitações](#limitações-e-avisos-honestos) antes de arriscares dinheiro.**
-> A estratégia é um ponto de partida sensato, **não foi validada com dados reais de ZEC**.
+> As regras são as que me descreveste; os números que as definem são propostas minhas e **nada foi validado
+> com dados reais de ZEC**.
 
-## Como decide (resumo)
+## Como decide (reversão — o teu estilo)
 
-Gráfico de **15m** para entradas, **1h** como filtro de tendência. Só opera a favor da tendência de 1h.
+Traduzi assim as tuas três regras. Um sinal só sai quando **as três condições coincidem** numa barra de 15m fechada:
 
-| | LONG | SHORT |
+| Condição | SHORT (longs sobrelotados) | LONG (shorts sobrelotados) |
 |---|---|---|
-| Tendência 1h | preço > EMA55 e EMA21 > EMA55 | o inverso |
-| Filtro de força | ADX(14) ≥ 18 no 15m (no pullback, também EMA21 > EMA55 no 15m) | igual (EMA21 < EMA55) |
-| **Pullback** | recuo até à EMA21 e fecho de volta acima com candle verde, RSI a subir (40–68), acima do VWAP diário | espelho |
-| **Breakout** | fecho acima do máximo das últimas 20 barras, volume ≥ 1.3× média, fecho na parte alta da barra, RSI ≤ 78, acima do VWAP, sem estar esticado (> 2.5 ATR da EMA21) | espelho |
-| Stop | mínimo/máximo das últimas 6 barras ± 0.2 ATR (entre 0.8 e 2.5 ATR, e ≥ 0.5% do preço) | espelho |
-| Alvos | TP1 = 1.5R (fecha 50%, stop passa a breakeven), TP2 = 3R | espelho |
+| **1. Mercado carregado** — funding do perp ZECUSDT da Binance, em %/8h | funding **≥ P90** dos últimos 30 dias *e* **≥ +0.03%** | funding **≤ P5** dos últimos 30 dias *e* **≤ −0.02%** ("extremamente") |
+| **2. Preço esticado** ("caro"/"barato") | nas últimas 3 barras, **≥ 2.5 ATR acima da EMA55** e RSI **≥ 65** | nas últimas 3 barras, **≥ 2.5 ATR abaixo da EMA55** e RSI **≤ 35** |
+| **3. Gatilho de rejeição** | candle vermelho com pavio de topo ≥ 35% da barra (ou a fechar abaixo da mínima anterior) e RSI a descer | candle verde com pavio de fundo ≥ 35% (ou a fechar acima da máxima anterior) e RSI a subir |
+| Stop | acima do máximo das últimas 8 barras + 0.2 ATR | abaixo do mínimo das últimas 8 barras − 0.2 ATR |
+| Alvos | TP1 = **1R** (fecha 50% e stop a breakeven), TP2 = **2R** | igual |
 
-Regras de disciplina: **1 trade de cada vez**, cooldown de 4 barras entre sinais, máx. **4 sinais/dia**,
-e **para o dia** ao atingir **−3R**. Saída a mercado ao fim de 12h.
+- **Nunca entra só porque "está caro"**: exige o candle de rejeição (senão seria apanhar uma faca a cair).
+- O **percentil** compara o funding de agora com os últimos 30 dias *do próprio ZEC*, por isso não tenho de
+  adivinhar o que é "alto" neste ativo; o **mínimo absoluto** impede que um funding perto de zero conte como
+  extremo. A base da Binance é +0.01%/8h. O intervalo de funding (8h/4h/1h) é deduzido dos próprios dados.
+- **"Evito long quando já está caro":** na reversão os longs só existem quando o preço está *barato* (condição 2).
+  Se usares `STRATEGY=trend` ou `both`, a regra `AVOID_EXPENSIVE_LONGS=true` trava os longs de tendência com o
+  preço a > 2 ATR da EMA55 ou RSI ≥ 70.
+- **Variante com OI:** `REV_USE_OI=true` exige também que o OI tenha **subido ≥ 3% nas últimas 24h** (posições a
+  acumular). Está desligada porque só se consegue testar ~30 dias (limite da Binance).
+- **Frequência:** o LONG exige o funding na cauda de 5% *e* negativo, o que na Binance é raro. Espera **poucos
+  sinais**, sobretudo de long. O backtest diz-te quantos.
 
-Cada mensagem traz entrada, stop, alvos, **tamanho sugerido** (para arriscares `RISK_PCT` da `ACCOUNT_SIZE`)
-e um limite de preço para não perseguires a entrada.
+Disciplina (igual à versão anterior): **1 trade de cada vez**, cooldown de 4 barras, máx. **4 sinais/dia**, e
+**para o dia** ao atingir **−3R**. Saída a mercado ao fim de 12h.
 
-## Hyperliquid, funding e OI
+Exemplo de mensagem (gerada pelo próprio robô com dados **simulados**; os números não são reais):
 
-- **Preços:** os candles vêm da própria Hyperliquid, por isso entrada/stop/alvos batem com o teu gráfico.
-  Se a Hyperliquid falhar, o robô **não** usa outra exchange (níveis de outra exchange não servem); avisa-te
-  no Telegram ao fim de 10 falhas seguidas. (`ALLOW_FALLBACK=true` liga a reserva, por tua conta e risco.)
-- **Em cada sinal** aparece: funding (em %/8h, equivalente à convenção da Binance/Bybit; a Hyperliquid cobra de hora a hora), prémio, OI em $, variação do OI
-  na última 1h e 4h, e uma leitura preço+OI (ex.: "preço↑ + OI↑: entram longs novos").
-  Avisa também se o funding estiver muito contra o teu lado (squeeze) e se o tamanho sugerido excede a
-  alavancagem máxima do ZEC na Hyperliquid.
-- **De onde vem o OI histórico:** a Hyperliquid só dá o OI *atual*. O robô guarda amostras de 5 em 5 minutos
-  (no ficheiro de estado) e calcula a variação a partir delas, por isso **a variação de 1h/4h só aparece depois
-  de 1h/4h a correr**. Com `COINALYZE_API_KEY` (chave gratuita) aparece logo desde o arranque.
-- **Filtros opcionais, DESLIGADOS por defeito** (`FUNDING_FILTER`, `OI_FILTER`): bloqueiam longs com funding
-  muito alto / shorts com funding muito negativo, e rupturas sem OI a subir. São regras de bolso populares,
-  **não há aqui evidência de que melhorem o resultado no ZEC**. Testa-as antes:
-
-```bash
-python -m zec_bot.backtest --funding-filter    # corre COM e SEM o filtro no mesmo período e compara
-python -m zec_bot.backtest --oi-filter         # precisa de COINALYZE_API_KEY; só cobre ~2-3 semanas
 ```
+🔴 ZEC SHORT — Reversão (longs sobrelotados) (15m)
+11/01 09:45
+
+Entrada: 52.90
+Stop: 53.51 (1.15%)
+TP1: 52.29 (1.0R) → fechar 50% e stop a breakeven
+TP2: 51.69 (2.0R)
+
+Tamanho (risco 1% de 2,000$): 33.00 ZEC ≈ 1,746$ (~0.9x)
+Porquê: funding +0.062%/8h (P100 dos últimos 30d) · preço 9.4 ATR acima da EMA55 · RSI pico 93 · candle de rejeição
+Contexto: 1h em alta (contra-tendência) · ADX 56 · RSI 89
+Funding Binance: +0.0620%/8h (longs pagam) · P100 dos últimos 30d · Hyperliquid +0.0100%/8h
+OI Binance: 50.00M$ · 1h +4.17% · 4h +4.17% · 24h +4.17% · prémio +0.200%
+Leitura: preço↑ + OI↑: entram longs novos
+Não entrar se o preço já passou 52.72. Saída a mercado após 12h.
+```
+
+### Modo tendência (opcional)
+
+`STRATEGY=trend` ou `both` ativa a estratégia anterior (a favor da tendência de 1h: pullback à EMA21 e rutura
+com volume; TP1 1.5R / TP2 3R). Em `both` o relatório do backtest separa cada tipo. Os filtros de
+funding/OI (`FUNDING_FILTER`, `OI_FILTER`) só se aplicam a este modo e estão desligados.
+
+## De onde vêm os dados
+
+- **Candles e preços:** Hyperliquid (onde operas), para os níveis baterem com o teu gráfico. Se falhar, o robô
+  **não** usa outra exchange (`ALLOW_FALLBACK=true` liga essa reserva por tua conta e risco) e avisa-te ao fim
+  de 10 falhas seguidas.
+- **Funding e open interest:** perp **ZECUSDT da Binance** (API pública `fapi.binance.com`, sem chave): o mesmo
+  mercado que vês no Coinalyze. Não preciso do Coinalyze, porque a Binance dá os mesmos dados diretamente.
+  O funding da Hyperliquid (o que pagas) e a alavancagem máxima do ZEC aparecem só como informação.
+- O funding usado é o último **liquidado**; o Coinalyze pode mostrar o previsto/atual, por isso podes ver
+  diferenças pequenas entre os dois.
+- Se a Binance falhar, o robô usa o funding em cache (até 6h, porque muda devagar) e, passado isso, **desativa a
+  reversão e avisa-te no Telegram**; nunca inventa crowding.
 
 ## Instalação no Mac
 
@@ -66,7 +94,6 @@ cp .env.example .env                                  # e edita o .env (ver abai
 2. Abre o teu bot novo e envia-lhe qualquer mensagem (ex.: "olá").
 3. Abre no browser `https://api.telegram.org/bot<TOKEN>/getUpdates` e copia o número de `"chat":{"id": ...}`.
 4. Põe no `.env`: `TELEGRAM_TOKEN=...` e `TELEGRAM_CHAT_ID=...`.
-5. (Opcional) `COINALYZE_API_KEY=...` — a chave gratuita da tua conta Coinalyze.
 
 Se preferires reutilizar o bot que já tens, podes (o envio de mensagens não interfere), mas **mantém
 `ENABLE_COMMANDS=false`**: dois programas a ler os comandos do mesmo bot roubam mensagens um ao outro.
@@ -77,32 +104,39 @@ Se preferires reutilizar o bot que já tens, podes (o envio de mensagens não in
 python -m zec_bot --check
 ```
 
-Confirma que consegue ir buscar os candles à Hyperliquid, mostra o estado atual do mercado, o funding e o OI
-(e, se tiveres chave, o do Coinalyze, com o símbolo que usou — **compara os números com o site**) e manda uma
-mensagem de teste para o Telegram. **Se isto falhar, resolve antes de avançar** (o erro diz o que falhou).
+Confirma que consegue ir buscar os candles à Hyperliquid e o funding/OI à Binance; mostra os números
+(**compara-os com o Coinalyze para ZECUSDT da Binance**), o percentil do funding e se, neste momento, o mercado
+está "carregado de longs", "carregado de shorts" ou neutro; e manda uma mensagem de teste para o Telegram.
+**Se algo falhar, resolve antes de avançar** (o erro diz o que falhou).
 
 ## Antes de confiares nele: corre o backtest
 
 ```bash
-python -m zec_bot.backtest                                       # candles da Hyperliquid: ~52 dias
-python -m zec_bot.backtest --days 365 --exchange binance --save-csv zec_15m.csv   # histórico longo
-python -m zec_bot.backtest --csv zec_15m.csv --side long         # repete sem voltar a descarregar
+python -m zec_bot.backtest --days 365 --exchange binance --save-csv zec_15m.csv   # reversão, histórico longo
+python -m zec_bot.backtest --csv zec_15m.csv --side short                          # só shorts, sem voltar a descarregar
+python -m zec_bot.backtest                                                         # candles da Hyperliquid (~52 dias)
+python -m zec_bot.backtest --strategy both --csv zec_15m.csv                       # reversão vs tendência, por tipo
+python -m zec_bot.backtest --use-oi                                                # reversão exigindo OI (só ~30 dias)
 ```
 
-**Limite importante:** a Hyperliquid só guarda as **últimas 5000 barras** (≈ 52 dias em 15m). Para um teste mais
-longo usa `--exchange binance` (ZEC/USDT): os preços são muito parecidos mas não idênticos, e o funding/OI
-podem diferir. O ideal é fazer os dois: histórico longo na Binance para ver se a ideia aguenta vários regimes,
-e o período recente na Hyperliquid para confirmar.
+Usa **exatamente o mesmo motor** do robô live (as mesmas funções calculam os features de funding e de OI), com
+comissões e derrapagem incluídas (`FEE_PCT` = 0.045%, o taker base da Hyperliquid; `SLIPPAGE_PCT`).
 
-O backtest usa **exatamente o mesmo motor** do robô live, com comissões e derrapagem incluídas
-(`FEE_PCT` = 0.045%, o taker base da Hyperliquid; `SLIPPAGE_PCT`), e mostra os resultados por setup, por lado e em **duas metades do período**.
+**Limites dos dados** (importante para não tirares conclusões a mais):
+
+| Dado | Quanto histórico dá |
+|---|---|
+| Candles da Hyperliquid | só as últimas 5000 barras (≈ 52 dias) |
+| Candles da Binance (`--exchange binance`) | anos (preços muito parecidos com os da Hyperliquid, não idênticos) |
+| Funding da Binance | anos; o backtest recua 33 dias antes da 1ª barra para o percentil ter a janela completa |
+| Open interest da Binance | **só ~30 dias**: `--use-oi` e `--oi-filter` só testam isso |
 
 Como o ler:
 - **R** = unidade de risco (1R = distância entrada→stop). `+20R` a 1% de risco ≈ +20% da conta (sem compor).
-- Se só **uma** das metades é lucrativa, o resultado depende do período — não é "edge".
-- Com menos de ~100 trades a amostra é fraca. Em 52 dias de Hyperliquid vais ter poucos: usa também `--days 365` na Binance.
-- **Não afines parâmetros até a curva ficar bonita**: isso é sobre-ajuste e falha ao vivo.
-  Se mudares alguma coisa, faz-o com uma razão e confirma nas duas metades.
+- **Reversões são raras.** Com poucos trades (< ~100) a amostra é fraca: usa `--days 365` (ou mais) na Binance.
+- Se só **uma** das metades do período é lucrativa, o resultado depende do período — não é "edge".
+- **Não afines parâmetros até a curva ficar bonita**: isso é sobre-ajuste e falha ao vivo. Se mudares um limiar,
+  faz-o por uma razão e confirma nas duas metades.
 - Podes testar cada lado com `--side long` / `--side short`.
 
 Idealmente, depois do backtest, deixa o robô correr **umas semanas só a observar os sinais** (sem dinheiro)
@@ -133,14 +167,21 @@ antigos** (só sinais de barras fechadas há menos de 5 minutos).
 
 ## Comandos do Telegram (opcional: `ENABLE_COMMANDS=true`)
 
-`/status` (preço, trade aberto) · `/stats` (resultados) · `/pause` / `/resume` (pausar sinais novos).
+`/status` (preço, trade aberto, funding e OI) · `/stats` (resultados) · `/pause` / `/resume` (pausar sinais novos).
 Só respondem ao teu `TELEGRAM_CHAT_ID`.
 
 ## Configuração
 
-Tudo no `.env` (ver `.env.example`). Os mais úteis: `SIDE`, `ACCOUNT_SIZE`, `RISK_PCT`, `FEE_PCT` (ajusta ao teu nível/desconto de HYPE), `ACTIVE_HOURS_UTC`
-(ex.: `7-22` para ignorar a madrugada, se descobrires que é pior), `MAX_SIGNALS_PER_DAY`, `DAILY_STOP_R`.
-Os parâmetros da estratégia estão em `zec_bot/strategy.py` (`Params`).
+Tudo no `.env` (ver `.env.example`, onde cada opção está explicada). Os que mais vais querer mexer:
+
+- **O que é "carregado":** `REV_SHORT_MIN_PCTL` (90) e `REV_SHORT_MIN_FUNDING_8H` (0.03) para os shorts;
+  `REV_LONG_MAX_PCTL` (5) e `REV_LONG_MAX_FUNDING_8H` (−0.02) para os longs; `CROWD_WINDOW_DAYS` (30).
+  **Estes números são propostas minhas** — diz-me o que consideras "muito" e "extremamente" carregado no ZEC
+  (em funding e em OI) e ajusto os valores por defeito.
+- `SIDE`, `ACCOUNT_SIZE`, `RISK_PCT`, `FEE_PCT` (ajusta ao teu nível/desconto de HYPE), `ACTIVE_HOURS_UTC`,
+  `MAX_SIGNALS_PER_DAY`, `DAILY_STOP_R`.
+- Os restantes parâmetros da estratégia (esticão de 2.5 ATR, RSI 65, pavio de 35%, alvos 1R/2R...) estão em
+  `zec_bot/strategy.py` (`Params`).
 
 ## Testes
 
@@ -148,32 +189,33 @@ Os parâmetros da estratégia estão em `zec_bot/strategy.py` (`Params`).
 pip install pytest && python -m pytest
 ```
 
-Cobrem: ausência de *lookahead* (os sinais numa barra não mudam com dados futuros), um controlo em
-passeio aleatório (sem tendência não pode haver lucro), a gestão do trade (stop/TP1/TP2/breakeven, casos
-ambíguos no pior cenário), as regras diárias, os filtros de funding/OI, os parsers das APIs e que **o robô
-live e o backtest abrem exatamente os mesmos trades**. Também garantem que funding e OI são alinhados com
-as barras **sem usar informação futura**, e que nenhum teste faz chamadas de rede reais.
+Cobrem, entre outras coisas: que **os sinais numa barra não mudam com dados futuros** (incluindo funding e OI),
+cada parte do gatilho de reversão isolada (retirar qualquer condição faz um teste falhar), controlos em dados
+aleatórios (sem informação real a estratégia tem de perder), a gestão do trade (stop/TP1/TP2/breakeven, casos
+ambíguos no pior cenário), as regras diárias, os parsers das APIs, mensagens válidas para o Telegram, e que
+**o robô live e o backtest abrem exatamente os mesmos trades** (tendência e reversão). Nenhum teste faz
+chamadas de rede reais.
 
 ## Limitações e avisos honestos
 
 - **Não validado em dados reais.** Foi desenvolvido num ambiente sem acesso às exchanges, por isso foi
-  testado com dados sintéticos e respostas de API simuladas. Os parâmetros são pontos de partida, não
-  resultados de otimização. O primeiro `--check` e o primeiro backtest no teu Mac são a validação a sério.
-- **As chamadas às APIs (Hyperliquid, Coinalyze, exchanges) não foram testadas contra os servidores reais**,
-  só contra respostas simuladas no formato documentado. Os formatos da Hyperliquid (`candleSnapshot`,
-  `metaAndAssetCtxs`, `fundingHistory`) foram confirmados na documentação; do Coinalyze confirmei a autenticação,
-  o formato da resposta e os limites, mas **os nomes exatos dos parâmetros (`symbols`, `interval`, `from`/`to`
-  em segundos) e a descoberta do símbolo da Hyperliquid vêm da minha leitura da documentação e podem precisar
-  de um ajuste** — o `--check` diz-te logo; se o símbolo estiver errado, define `COINALYZE_SYMBOL`.
-  O robô nunca pára por falhas de derivados: os sinais saem na mesma, só sem essas linhas.
-- **O OI do Coinalyze pode estar em unidades diferentes do da Hyperliquid** (moeda vs. $): por isso só se
-  comparam variações % dentro da mesma fonte, e a mensagem indica quando vem do Coinalyze.
-- **Um backtest bom não garante lucro.** O ZEC é volátil e depende de regimes (tendências fortes, notícias,
-  listagens/delistagens). Os custos e a execução real (derrapagem, latência entre o sinal e a tua ordem)
-  costumam ser piores do que o assumido.
+  testado com dados sintéticos e respostas de API simuladas. **Não sei se esta estratégia de reversão dá
+  dinheiro em ZEC**; os limiares são propostas. O primeiro `--check` e o primeiro backtest no teu Mac são a
+  validação a sério.
+- **As chamadas às APIs não foram testadas contra os servidores reais**, só contra respostas simuladas no
+  formato documentado. Confirmei os formatos na documentação da Hyperliquid (`candleSnapshot`,
+  `metaAndAssetCtxs`) e da Binance (`fundingRate`, `premiumIndex`, `openInterestHist`, `fundingInfo`); o
+  `openInterest` (OI atual) segue o formato que conheço. Se algum falhar, o `--check` diz-te qual.
+- **Operar reversão tem um perfil de risco próprio:** o mercado pode continuar "carregado" durante dias e um
+  squeeze ou uma tendência forte pode passar por cima do teu stop várias vezes seguidas. Funding extremo não é
+  um sinal de viragem por si só — por isso o gatilho de rejeição e o stop são obrigatórios, e o limite diário de
+  −3R existe. Espera taxas de acerto altas nalguns períodos e sequências de stops noutros.
+- **Um backtest bom não garante lucro.** O ZEC é volátil e depende de regimes (notícias, listagens/delistagens).
+  Os custos e a execução real (derrapagem, latência entre o sinal e a tua ordem) costumam ser piores do que o
+  assumido. O funding e o OI são da Binance; o que pagas e o que executas é na Hyperliquid.
 - Os resultados do robô assumem entrada ao preço de fecho da barra do sinal; quando vês a mensagem já
   passaram alguns segundos. Respeita o limite de preço da mensagem.
 - Em barras onde o preço toca no stop e no alvo, assume-se sempre o **pior caso** (stop primeiro).
-- Se operares com alavancagem, o "tamanho sugerido" mostra a alavancagem implícita: confirma que o stop
-  fica bem longe da liquidação.
+- Se operares com alavancagem, o "tamanho sugerido" mostra a alavancagem implícita e avisa se exceder o máximo
+  do ZEC na Hyperliquid; confirma que o stop fica bem longe da liquidação.
 - **Não é aconselhamento financeiro.** Só arrisca dinheiro que possas perder.
