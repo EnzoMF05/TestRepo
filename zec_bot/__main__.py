@@ -15,7 +15,9 @@ from .config import Config
 from .data import get_candles
 from .derivs import DerivsMonitor
 from .messages import _px
+from .oi_hourly import OiCascade
 from .strategy import Params, prepare
+from .sweep import SweepParams, atr14, best_tier, evaluate, fmt_px, hourly_candles, level_age_h, load_levels, pick_event
 from .telegram import Telegram
 
 
@@ -28,6 +30,41 @@ def _crowd_state(row, p: Params) -> str:
     if f8 <= p.rev_long_max_funding_8h and pc <= p.rev_long_max_pctl:
         return "SHORTS sobrelotados (extremo) → a estratégia só procura LONGS de reversão"
     return "neutro → sem reversões possíveis agora"
+
+
+def check_sweep(cfg: Config, df: pd.DataFrame) -> None:
+    """Valida o pipeline do sweep com dados reais: níveis, OI e a avaliação da ÚLTIMA vela 1H fechada."""
+    print("\n   Sweep de nível (método da mesa):")
+    cluster, err = load_levels(cfg.niveis_path, cfg.base)
+    if cluster is None:
+        print(f"   ✖ níveis: {err}\n     Sem níveis o modo sweep não avalia nada. Copia o niveis.csv da mesa para {cfg.niveis_path} "
+              f"(colunas: ticker,cluster_below,cluster_above,spot_approx,atualizado_utc) ou define NIVEIS_PATH.")
+        return
+    age = level_age_h(cluster, pd.Timestamp.now(tz="UTC").to_pydatetime())
+    print(f"   ✔ níveis {cfg.base}: abaixo {cluster['below']} · acima {cluster['above']} · spot≈{cluster['spot_approx']} · "
+          f"idade {'n/d' if age is None else f'{age:.1f}h'}" + (f" · ⚠ {cluster['erro']}" if cluster.get("erro") else ""))
+    if age is not None and age > 6:
+        print("     ⚠ níveis com mais de 6h: confirma que o teu feeder os atualiza (NIVEIS_MAX_AGE_H bloqueia se quiseres).")
+    cs = hourly_candles(df, cfg.interval_min, last_hours=45)
+    if len(cs) < 15:
+        print("   ✖ velas 1H insuficientes para o ATR14")
+        return
+    candle, atr = cs[-1], atr14(cs)
+    oi = OiCascade.from_cfg(cfg).delta(candle["t"])
+    ts = pd.Timestamp(candle["t"], unit="ms", tz="UTC")
+    print(f"   Última vela 1H fechada ({ts:%Y-%m-%d %H:%M}Z): O {candle['open']} H {candle['high']} L {candle['low']} "
+          f"C {candle['close']} · ATR14 {atr:.4f}")
+    if oi["delta"] is None:
+        print(f"   ✖ OI 1H: sem valor ({'; '.join(oi['errors'])}). Sem OI o sinal nunca passa de L1.")
+    else:
+        print(f"   ✔ OI 1H desta vela: {oi['delta']:+.2f}% ({oi['src']}) — compara com o Coinalyze/CoinGlass (ZECUSDT, Binance, 1H)")
+    evs = evaluate(cluster, candle, atr, oi["delta"], SweepParams.from_cfg(cfg))
+    ev = pick_event(evs)
+    if ev is None:
+        print(f"   Avaliação: {evs[0]['motivo']} (sem varredura de nenhum nível)")
+    else:
+        print(f"   Avaliação: tier {best_tier(evs)} · {ev['lado']} · {ev['motivo']} · pavio {ev['rejeicao']:.0f}% "
+              f"· face {fmt_px(ev['level'])} · válido={ev['valido']}")
 
 
 def check(cfg: Config) -> int:
@@ -68,13 +105,16 @@ def check(cfg: Config) -> int:
         print("     (compara estes números com o que vês no Coinalyze para ZECUSDT da Binance)")
         print(f"   Estado de crowding agora: {_crowd_state(frame.iloc[-1], p)}")
 
+    if cfg.strategy == "sweep":
+        check_sweep(cfg, df)
     feat = prepare(df, p, deriv=frame)
     last = feat.iloc[-1]
     recent = feat.iloc[-400:]
     by_kind = recent[recent["sig"] != 0]["kind"].value_counts().to_dict()
     print(f"\n3) Estado atual: tendência 1h={'alta' if last['htf'] > 0 else 'baixa' if last['htf'] < 0 else 'neutra'} · "
           f"ADX {last['adx']:.1f} · RSI {last['rsi']:.1f} · ATR {last['atr'] / last['close'] * 100:.2f}%")
-    print(f"   Sinais brutos nas últimas 400 barras: {by_kind or 'nenhum'}")
+    if cfg.strategy != "sweep":
+        print(f"   Sinais brutos nas últimas 400 barras: {by_kind or 'nenhum'}")
 
     print("\n4) A enviar mensagem de teste para o Telegram…")
     ok = Telegram(cfg.telegram_token, cfg.telegram_chat_id).send(

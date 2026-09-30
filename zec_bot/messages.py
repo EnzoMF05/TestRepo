@@ -8,6 +8,7 @@ import pandas as pd
 
 from .config import Config
 from .engine import Event, Trade
+from .sweep import fmt_px
 
 
 def _px(x: float) -> str:
@@ -113,14 +114,53 @@ def _leverage_warning(lev: float, deriv: dict | None) -> str:
     return ""
 
 
+def format_sweep_signal(t: Trade, cfg: Config, deriv: dict | None = None) -> str:
+    """Alerta L2 do método da mesa: ordem LIMIT na face do nível (paper)."""
+    m = t.meta
+    long_ = t.side == "long"
+    icon, word = ("🟢", "LONG") if long_ else ("🔴", "SHORT")
+    qty, notional, lev = position_size(cfg, t.entry, t.risk)
+    a = m["plan_a"]
+    warn = ""
+    if m["marketable"]:
+        warn = (f"⚠️ O nível ({fmt_px(t.entry)}) está do lado errado do mercado (fecho {fmt_px(m['candle_close_px'])}): "
+                f"este limite executaria logo, a mercado. Sem reclaim.\n")
+    dist = "" if m.get("dist_atr") is None else f" · dist_atr {m['dist_atr']:.2f}"
+    return (
+        f"{icon} <b>{cfg.base} {word}</b> — Sweep de nível · L2 (1H)\n"
+        f"<i>Vela 1H {_local(m['candle_open'], cfg)} → {_local(m['candle_open'], cfg, 60)} (Lisboa)</i>\n\n"
+        f"LIMIT na face: <b>{fmt_px(t.entry)}</b> (nunca a mercado)\n"
+        f"Stop: <b>{fmt_px(t.stop0)}</b> ({t.risk / t.entry * 100:.2f}%) · extremo da vela ∓ {cfg.sweep_stop_atr:g} ATR\n"
+        f"Alvo {cfg.sweep_target_r:g}R: <b>{fmt_px(t.tp1)}</b>\n\n"
+        f"Pavio {m['rejeicao']:.0f}% · OI {m['oi_delta']:+.1f}% na hora ({m['oi_src']}){dist}\n"
+        f"Plano A (fecho/2R): {fmt_px(a['entrada'])} → {fmt_px(a['alvo'])}\n"
+        f"Válido até {_local(m['valid_until'], cfg)} · cancela se não executar até {_local(m['cancel_at'], cfg)} (Lisboa)\n"
+        f"Tamanho (risco {cfg.risk_pct:g}% de {cfg.account_size:,.0f}$): {qty:.2f} {cfg.base} ≈ {notional:,.0f}$ (~{lev:.1f}x)\n"
+        f"{_leverage_warning(lev, deriv)}"
+        f"{warn}"
+        f"{derivs_lines(deriv, t.side, cfg)}"
+        f"Só sinal: o robô não executa ordens."
+    )
+
+
 def format_event(ev: Event, cfg: Config) -> str | None:
     t = ev.trade
+    if ev.kind == "note":
+        return f"ℹ️ {html.escape(ev.data['text'], quote=False)}"
+    if ev.kind == "filled" and t:
+        extra = " (o nível já estava do lado errado do mercado: fill imediato ao preço do limite)" if t.meta.get("marketable") else ""
+        return (f"📥 <b>{cfg.base} {t.side.upper()}</b> — limite executado a {fmt_px(t.entry)}{extra}\n"
+                f"Stop {fmt_px(t.stop0)} · alvo {fmt_px(t.tp1)} · válido até {_local(t.meta['valid_until'], cfg)} (Lisboa)")
+    if ev.kind == "cancelled" and t:
+        return (f"⏹ <b>{cfg.base} {t.side.upper()}</b> — limite cancelado sem executar "
+                f"(prazo {_local(ev.data['cancel_at'], cfg)} Lisboa). Sem resultado.")
     if ev.kind == "tp1" and t:
         return (f"🎯 <b>{cfg.base} {t.side.upper()}</b> — TP1 atingido ({_px(t.tp1)})\n"
                 f"Fecha 50% e move o stop para breakeven ({_px(t.entry)}).")
     if ev.kind == "closed" and t:
         why = {"stop": "Stop atingido", "tp2": "TP2 atingido", "breakeven": "Fechado em breakeven (após TP1)",
-               "tempo": "Fechado por tempo"}[t.exit_reason]
+               "tempo": "Validade esgotada: fechado a mercado" if t.kind == "sweep" else "Fechado por tempo",
+               "target": f"Alvo atingido ({t.tp1_r:.2f}R)"}[t.exit_reason]
         icon = "✅" if t.r_net > 0 else "❌"
         return (f"{icon} <b>{cfg.base} {t.side.upper()}</b> — {why}\n"
                 f"Resultado: <b>{t.r_net:+.2f}R</b> (já com comissões/derrapagem)")
@@ -155,7 +195,10 @@ def format_status(engine, cfg: Config, last_price: float, exchange: str, deriv: 
     lines = [f"🤖 <b>{cfg.base} bot</b> — {'⏸ em pausa' if engine.paused else '▶️ ativo'}",
              f"Preço: {_px(last_price)} ({exchange})",
              f"Hoje: {engine.day_signals} sinais · {engine.day_r:+.2f}R"]
-    if t:
+    if t and t.state == "pending":
+        lines.append(f"Ordem LIMIT pendente: {t.side.upper()} sweep @ {fmt_px(t.entry)} · stop {fmt_px(t.stop0)} · "
+                     f"alvo {fmt_px(t.tp1)} · cancela {_local(t.meta['cancel_at'], cfg)} (Lisboa)")
+    elif t:
         lines.append(f"Trade aberto: {t.side.upper()} {t.kind} @ {_px(t.entry)} · stop {_px(t.stop)} · "
                      f"TP1 {_px(t.tp1)} · TP2 {_px(t.tp2)} ({t.state})")
     else:
@@ -167,5 +210,8 @@ def format_status(engine, cfg: Config, last_price: float, exchange: str, deriv: 
 
 
 def format_startup(cfg: Config, exchange: str) -> str:
-    return (f"🚀 <b>{cfg.base} day-trading bot</b> iniciado ({exchange}, {cfg.interval_str}, lado: {cfg.side})\n"
+    if cfg.strategy == "sweep":
+        return (f"🚀 <b>{cfg.base} sweep de nível</b> iniciado ({exchange}, velas 1H, níveis: {cfg.niveis_path})\n"
+                f"Avalia às :02 de cada hora · sinais apenas — o robô NÃO executa ordens. Não é aconselhamento financeiro.")
+    return (f"🚀 <b>{cfg.base} day-trading bot</b> iniciado ({exchange}, {cfg.interval_str}, estratégia: {cfg.strategy}, lado: {cfg.side})\n"
             f"Sinais apenas — o robô NÃO executa ordens. Nada disto é aconselhamento financeiro.")

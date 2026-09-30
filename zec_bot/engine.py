@@ -34,7 +34,7 @@ class Trade:
     risk: float
     open_time: str
     cost_r: float  # comissões+derrapagem expressas em R
-    state: str = "open"  # open | tp1 | closed
+    state: str = "open"  # pending (ordem LIMIT por executar) | open | tp1 | closed
     bars_held: int = 0
     realized_r: float = 0.0  # R bruto já garantido (metade do TP1)
     exit_reason: str = ""
@@ -43,6 +43,8 @@ class Trade:
     r_net: float = 0.0
     tp1_r: float = 1.5  # alvos em R deste trade (a reversão usa alvos mais curtos que a tendência)
     tp2_r: float = 3.0
+    single_target: bool = False  # True: sai tudo no alvo `tp1` (sweep de nível); False: 50% no TP1 + resto no TP2
+    meta: dict = field(default_factory=dict)  # contexto extra (nível, tier, OI, prazos...) guardado com o trade
 
     @property
     def d(self) -> int:
@@ -63,7 +65,7 @@ class Trade:
 
     def step(self, high: float, low: float, close: float, time: str, p: Params, max_hold: int) -> list[str]:
         """Processa uma barra FECHADA. Devolve os eventos ocorridos: 'tp1' e/ou 'closed'."""
-        if self.state == "closed":
+        if self.state in ("closed", "pending"):
             return []
         events: list[str] = []
         self.bars_held += 1
@@ -71,6 +73,9 @@ class Trade:
         if self.state == "open":
             if self._stop_hit(high, low):
                 self._close(-1.0, "stop", time)
+                return ["closed"]
+            if self.single_target and self._reached(self.tp1, high, low):
+                self._close(self.tp1_r, "target", time)  # alvo único: sai tudo (sem breakeven a meio)
                 return ["closed"]
             if self._reached(self.tp1, high, low):
                 self.state = "tp1"
@@ -97,9 +102,15 @@ class Trade:
         return events
 
 
+    def force_close(self, price: float, time: str, reason: str) -> None:
+        """Fecha a mercado ao preço `price` (ex.: fim da validade): marca o que falta a mercado."""
+        remaining = 0.5 if self.state == "tp1" else 1.0
+        self._close(self.realized_r + remaining * self.d * (price - self.entry) / self.risk, reason, time)
+
+
 @dataclass
 class Event:
-    kind: str  # signal | tp1 | closed | daily_stop | day_summary | blocked
+    kind: str  # signal | tp1 | closed | daily_stop | day_summary | blocked | sweep_signal | filled | cancelled
     trade: Optional[Trade] = None
     data: dict = field(default_factory=dict)
 
@@ -183,11 +194,7 @@ class Engine:
         iso = ts.isoformat()
         events: list[Event] = []
 
-        day = ts.strftime("%Y-%m-%d")
-        if day != self.day:
-            if self.day:
-                events.append(Event("day_summary", data=self._day_stats(self.day)))
-            self.day, self.day_signals, self.day_r, self.day_stopped = day, 0, 0.0, False
+        self._roll_day(ts, events)
 
         row = feat.iloc[i]
         if self.trade is not None:
@@ -219,6 +226,14 @@ class Engine:
                 events.append(Event("signal", self.trade, data={"htf": sig.htf, "rsi": sig.rsi, "adx": sig.adx,
                                                                 "info": sig.info}))
         return events
+
+    def _roll_day(self, ts: pd.Timestamp, events: list) -> None:
+        """Na mudança de dia UTC emite o resumo do dia anterior e zera os contadores."""
+        day = ts.strftime("%Y-%m-%d")
+        if day != self.day:
+            if self.day:
+                events.append(Event("day_summary", data=self._day_stats(self.day)))
+            self.day, self.day_signals, self.day_r, self.day_stopped = day, 0, 0.0, False
 
     def _open(self, sig: Signal, iso: str) -> Trade:
         self.seq += 1

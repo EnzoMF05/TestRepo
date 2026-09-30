@@ -77,3 +77,37 @@ def informed_funding(df, threshold: float = 4.0) -> dict:
     lo = base["stretch_dn"].fillna(0).groupby(win).max()
     return {int(w.timestamp() * 1000): (-0.0006 if lo[w] >= threshold else (0.0008 if hi[w] >= threshold else 0.0001))
             for w in hi.index}
+
+
+def sweep_scenario(direction: int = +1, n: int = 400, seed: int = 11, level: float | None = None,
+                   hour: tuple | None = None):
+    """15m à volta de 100 (ATR 1H ~2) cuja ÚLTIMA hora varre um nível. Devolve (candles, info).
+
+    direction=+1: varre 98.5 por baixo (low 97.0), fecha de volta acima -> LONG; -1: varre 101.5 por cima -> SHORT.
+    `hour` = ((o,h,l,c) x 4) troca as 4 barras da hora varrida; `level` troca o nível.
+    """
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2026-03-01 00:00", periods=n, freq="15min", tz="UTC")
+    close = 100 + rng.normal(0, 0.6, n)
+    open_ = np.r_[close[0], close[:-1]]
+    high = np.maximum(open_, close) + np.abs(rng.normal(0, 0.25, n))
+    low = np.minimum(open_, close) - np.abs(rng.normal(0, 0.25, n))
+    df = pd.DataFrame({"open": open_, "high": high, "low": low, "close": close, "volume": 1000.0}, index=idx)
+    if hour is None:
+        hour = ((100.0, 100.3, 99.4, 99.6), (99.6, 99.7, 97.0, 97.4), (97.4, 99.2, 97.3, 99.0), (99.0, 100.4, 98.9, 99.9)) \
+            if direction > 0 else \
+            ((100.0, 100.6, 99.7, 100.4), (100.4, 103.0, 100.3, 102.6), (102.6, 102.7, 100.8, 101.0), (101.0, 101.1, 99.6, 100.1))
+    df.iloc[-4:, :4] = np.array(hour)
+    df.index.name = "time"
+    lvl = level if level is not None else (98.5 if direction > 0 else 101.5)
+    return df, {"level": lvl, "last": n - 1, "candle_open": idx[-4], "close_ts": idx[-1] + pd.Timedelta(minutes=15),
+                "direction": direction}
+
+
+def append_bars(df: pd.DataFrame, bars: list) -> pd.DataFrame:
+    """Acrescenta barras de 15m (o,h,l,c) a seguir ao fim de `df`."""
+    idx = pd.date_range(df.index[-1] + pd.Timedelta(minutes=15), periods=len(bars), freq="15min", tz="UTC")
+    extra = pd.DataFrame(bars, columns=["open", "high", "low", "close"], index=idx).assign(volume=1000.0)
+    out = pd.concat([df, extra])
+    out.index.name = "time"
+    return out

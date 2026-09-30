@@ -17,12 +17,15 @@ from .config import Config
 from .data import get_candles
 from .derivs import DerivsMonitor
 from .engine import Engine
+from .oi_hourly import OiCascade
 from .strategy import Params, prepare
+from .sweep_engine import SweepEngine, SweepJournal
 from .telegram import Telegram
 
 log = logging.getLogger("zec_bot")
 
 MAX_SIGNAL_AGE = pd.Timedelta(minutes=5)  # não enviar sinais "velhos" (ex.: Mac saiu de suspensão)
+SWEEP_MAX_AGE = pd.Timedelta(minutes=12)  # a mesa aceita a vela horária até às :12 (janela de catch-up)
 ALERT_AFTER_FAILURES = 10
 
 
@@ -35,10 +38,20 @@ class Bot:
         tg: Telegram | None = None,
         now: Callable[[], pd.Timestamp] | None = None,
         derivs: DerivsMonitor | None = None,
+        engine: Engine | None = None,
     ):
         self.cfg = cfg
         self.p = params or Params.from_cfg(cfg)
-        self.engine = Engine(cfg, self.p)
+        if engine is not None:
+            self.engine = engine
+        elif cfg.strategy == "sweep":
+            self.engine = SweepEngine(cfg, self.p, journal=SweepJournal(cfg.sweep_journal, cfg.sweep_results),
+                                      oi=OiCascade.from_cfg(cfg).delta)
+        else:
+            self.engine = Engine(cfg, self.p)
+        sweep = cfg.strategy == "sweep"
+        self.settle = pd.Timedelta(seconds=cfg.sweep_settle_s) if sweep else pd.Timedelta(0)
+        self.max_age = SWEEP_MAX_AGE if sweep else MAX_SIGNAL_AGE
         self.tg = tg or Telegram(cfg.telegram_token, cfg.telegram_chat_id)
         self.fetch = fetch or (
             lambda: get_candles(cfg.exchange, cfg.base, cfg.quote, cfg.interval_min, self.p.warmup_bars + 50,
@@ -74,11 +87,12 @@ class Bot:
     # ------------------------------------------------------------------ ciclo
     def _dispatch(self, events, deriv: dict | None = None) -> None:
         for ev in events:
-            text = (
-                messages.format_signal(ev.trade, self.cfg, deriv=deriv, **ev.data)
-                if ev.kind == "signal"
-                else messages.format_event(ev, self.cfg)
-            )
+            if ev.kind == "signal":
+                text = messages.format_signal(ev.trade, self.cfg, deriv=deriv, **ev.data)
+            elif ev.kind == "sweep_signal":
+                text = messages.format_sweep_signal(ev.trade, self.cfg, deriv)
+            else:
+                text = messages.format_event(ev, self.cfg)
             log.info("evento %s%s", ev.kind, f" ({ev.data['reason']})" if ev.kind == "blocked" else "")
             if text:
                 self.tg.send(text)
@@ -120,15 +134,22 @@ class Bot:
             todo = [len(feat) - 1]  # primeira vez: só a barra mais recente, sem reprocessar histórico
         last_i = len(feat) - 1
 
+        done = 0
         for i in todo:
             closed_at = feat.index[i] + pd.Timedelta(minutes=self.cfg.interval_min)
-            fresh = self.now() - closed_at <= MAX_SIGNAL_AGE
+            if self.now() < closed_at + self.settle:
+                break  # a barra ainda está a "assentar" (Hyperliquid/OI): processa no próximo ciclo
+            fresh = self.now() - closed_at <= self.max_age
             evaluate = i == last_i and fresh
-            snap = self._deriv_snapshot(feat, i, frame) if evaluate and feat["sig"].iloc[i] != 0 else None
-            self._dispatch(self.engine.on_bar(feat, i, evaluate=evaluate, deriv=self._frame_row(frame, i)), snap)
-        if todo:
+            events = self.engine.on_bar(feat, i, evaluate=evaluate, deriv=self._frame_row(frame, i))
+            snap = None
+            if any(e.kind in ("signal", "sweep_signal") for e in events):
+                snap = self._deriv_snapshot(feat, i, frame)  # funding/OI da Binance só para o texto do alerta
+            self._dispatch(events, snap)
+            done += 1
+        if done:
             self._save_state()
-        return len(todo)
+        return done
 
     def _deriv_snapshot(self, feat: pd.DataFrame, i: int, frame: pd.DataFrame | None = None) -> dict | None:
         """Números de funding/OI para a mensagem do sinal da barra `i`. Falha silenciosa: é contexto."""

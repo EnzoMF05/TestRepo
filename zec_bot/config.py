@@ -44,7 +44,7 @@ class Config:
     interval_min: int = 15
 
     # --- Estratégia ---
-    strategy: str = "reversal"  # reversal (contra o excesso) | trend (a favor da tendência) | both
+    strategy: str = "reversal"  # reversal | trend | both | sweep (o método da mesa: sweep de nível + pavio + OI)
     avoid_expensive_longs: bool = True  # sem longs de tendência quando o preço já está "caro"
 
     # --- Reversão: quão "carregado" tem de estar o mercado (funding da Binance, em %/8h) ---
@@ -58,6 +58,27 @@ class Config:
     rev_use_oi: bool = False  # exigir também OI a subir (posições a acumular); só testável ~30 dias
     rev_oi_hours: float = 24.0
     rev_oi_min_pct: float = 3.0
+
+    # --- Sweep de nível (o método da mesa "CT-NÍVEL"; valores por defeito = os do hourly_scan.py) ---
+    niveis_path: str = "niveis.csv"  # cópia local do niveis.csv (ticker,cluster_below,cluster_above,spot_approx,atualizado_utc)
+    niveis_max_age_h: float = 0.0  # 0 = nunca bloqueia por idade (como a mesa); >0 = ignora níveis mais velhos
+    coinglass_api_key: str = ""  # OI 1H da Binance via CoinGlass (1ª fonte da cascata da mesa)
+    coinalyze_api_key: str = ""  # OI 1H da Binance via Coinalyze (2ª fonte; símbolo ZECUSDT_PERP.A)
+    sweep_oi_max_pct: float = -3.0  # OI da hora <= -3% => L2
+    sweep_wick_min_pct: float = 50.0  # pavio >= 50% da amplitude => L1
+    sweep_stop_atr: float = 0.1  # stop = extremo da vela +/- 0.1 ATR14
+    sweep_target_r: float = 1.5
+    sweep_r_max_atr: float = 1.2  # veto se |limite-stop| > 1.2 ATR14
+    sweep_cost_side_pct: float = 0.035  # maker 0.015% + derrapagem 0.02% por lado
+    sweep_require_reclaim: bool = False  # True = exigir fecho de volta dentro do nível (no original não funcionava)
+    sweep_valid_h: float = 4.0  # o trade deixa de valer ao fim de 4h
+    sweep_cancel_h: float = 2.0  # cancela o limite sem fill ao fim de 2h
+    sweep_count_from_alert: bool = False  # False = como o original: contar desde a ABERTURA da vela varrida
+    sweep_settle_s: int = 125  # espera após o fecho da hora (a mesa corre às :02:05: dá tempo à Hyperliquid e ao OI)
+    sweep_oi_attempts: int = 3
+    sweep_oi_retry_s: int = 20
+    sweep_journal: str = "zec_sweep_journal.csv"
+    sweep_results: str = "zec_sweep_results.csv"
 
     # --- Filtros opcionais da estratégia de tendência (desligados) ---
     funding_filter: bool = False  # bloqueia longs com funding muito alto / shorts com funding muito negativo
@@ -124,6 +145,25 @@ class Config:
         c.exchange = _get("EXCHANGE", c.exchange).lower()
         c.allow_fallback = _bool("ALLOW_FALLBACK", c.allow_fallback)
         c.strategy = _get("STRATEGY", c.strategy).lower()
+        c.niveis_path = _get("NIVEIS_PATH", c.niveis_path)
+        c.niveis_max_age_h = float(_get("NIVEIS_MAX_AGE_H", str(c.niveis_max_age_h)))
+        c.coinglass_api_key = _get("COINGLASS_API_KEY", c.coinglass_api_key)
+        c.coinalyze_api_key = _get("COINALYZE_API_KEY", c.coinalyze_api_key)
+        c.sweep_oi_max_pct = float(_get("SWEEP_OI_MAX_PCT", str(c.sweep_oi_max_pct)))
+        c.sweep_wick_min_pct = float(_get("SWEEP_WICK_MIN_PCT", str(c.sweep_wick_min_pct)))
+        c.sweep_stop_atr = float(_get("SWEEP_STOP_ATR", str(c.sweep_stop_atr)))
+        c.sweep_target_r = float(_get("SWEEP_TARGET_R", str(c.sweep_target_r)))
+        c.sweep_r_max_atr = float(_get("SWEEP_R_MAX_ATR", str(c.sweep_r_max_atr)))
+        c.sweep_cost_side_pct = float(_get("SWEEP_COST_SIDE_PCT", str(c.sweep_cost_side_pct)))
+        c.sweep_require_reclaim = _bool("SWEEP_REQUIRE_RECLAIM", c.sweep_require_reclaim)
+        c.sweep_valid_h = float(_get("SWEEP_VALID_H", str(c.sweep_valid_h)))
+        c.sweep_cancel_h = float(_get("SWEEP_CANCEL_H", str(c.sweep_cancel_h)))
+        c.sweep_count_from_alert = _bool("SWEEP_COUNT_FROM_ALERT", c.sweep_count_from_alert)
+        c.sweep_settle_s = int(_get("SWEEP_SETTLE_S", str(c.sweep_settle_s)))
+        c.sweep_oi_attempts = int(_get("SWEEP_OI_ATTEMPTS", str(c.sweep_oi_attempts)))
+        c.sweep_oi_retry_s = int(_get("SWEEP_OI_RETRY_S", str(c.sweep_oi_retry_s)))
+        c.sweep_journal = _get("SWEEP_JOURNAL", c.sweep_journal)
+        c.sweep_results = _get("SWEEP_RESULTS", c.sweep_results)
         c.avoid_expensive_longs = _bool("AVOID_EXPENSIVE_LONGS", c.avoid_expensive_longs)
         c.crowd_window_days = float(_get("CROWD_WINDOW_DAYS", str(c.crowd_window_days)))
         c.rev_short_min_pctl = float(_get("REV_SHORT_MIN_PCTL", str(c.rev_short_min_pctl)))
@@ -156,6 +196,8 @@ class Config:
         c.timezone = _get("TIMEZONE", c.timezone)
         if c.side not in ("long", "short", "both"):
             raise ValueError("SIDE tem de ser long, short ou both")
-        if c.strategy not in ("reversal", "trend", "both"):
-            raise ValueError("STRATEGY tem de ser reversal, trend ou both")
+        if c.strategy not in ("reversal", "trend", "both", "sweep"):
+            raise ValueError("STRATEGY tem de ser reversal, trend, both ou sweep")
+        if c.strategy == "sweep" and (c.interval_min <= 0 or 60 % c.interval_min):
+            raise ValueError("com STRATEGY=sweep o INTERVAL_MIN tem de dividir 60 (ex.: 15)")
         return c

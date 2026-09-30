@@ -58,7 +58,7 @@ class Params:
     tp2_r: float = 3.0
 
     # --- modo e "caro" (aplica-se à estratégia de tendência) ---
-    mode: str = "trend"  # trend | reversal | both   (Config.strategy escolhe o do utilizador: reversal)
+    mode: str = "trend"  # trend | reversal | both | sweep   (Config.strategy escolhe o do utilizador)
     avoid_expensive_longs: bool = False
     avoid_ext_atr: float = 2.0  # "caro" = a mais de 2 ATR acima da EMA55...
     avoid_rsi: float = 70.0  # ... ou RSI >= 70
@@ -205,7 +205,7 @@ def prepare(df: pd.DataFrame, p: Params | None = None, deriv: pd.DataFrame | Non
     if p.avoid_expensive_longs:
         expensive = (ext_slow_up >= p.avoid_ext_atr) | (f["rsi"] >= p.avoid_rsi)
         long_pb, long_bo = long_pb & ~expensive, long_bo & ~expensive
-    if p.mode == "reversal":
+    if p.mode in ("reversal", "sweep"):
         long_pb = long_bo = short_pb = short_bo = pd.Series(False, index=f.index)
 
     # ---------- REVERSÃO: mercado carregado + preço esticado + gatilho de rejeição ----------
@@ -230,7 +230,7 @@ def prepare(df: pd.DataFrame, p: Params | None = None, deriv: pd.DataFrame | Non
         crowd_short & (stretch_dn >= p.rev_ext_atr) & (f["rsi_lo3"] <= 100 - p.rev_rsi)
         & (c > o) & ((lo_wick >= p.rev_wick) | (c > h.shift(1))) & (f["rsi"] > rsi_prev)
     )
-    if p.mode == "trend" or deriv is None:
+    if p.mode in ("trend", "sweep") or deriv is None:
         rev_short = rev_long = pd.Series(False, index=f.index)
 
     # stop além do extremo recente (reversão): mais folga que na tendência

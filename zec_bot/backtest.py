@@ -181,7 +181,7 @@ def main() -> int:
     ap.add_argument("--exchange", default=None, help="hyperliquid (~52 dias) | binance | bybit | okx (histórico longo)")
     ap.add_argument("--csv", help="usa um CSV guardado em vez de ir à exchange")
     ap.add_argument("--save-csv", help="guarda os candles descarregados")
-    ap.add_argument("--strategy", choices=["reversal", "trend", "both"])
+    ap.add_argument("--strategy", choices=["reversal", "trend", "both", "sweep"])
     ap.add_argument("--side", choices=["long", "short", "both"])
     ap.add_argument("--fee", type=float, help="comissão por lado, em %%")
     ap.add_argument("--slippage", type=float, help="derrapagem por lado, em %%")
@@ -203,6 +203,12 @@ def main() -> int:
     cfg.funding_filter = cfg.funding_filter or args.funding_filter
     cfg.oi_filter = cfg.oi_filter or args.oi_filter
     cfg.rev_use_oi = cfg.rev_use_oi or args.use_oi
+    if cfg.strategy == "sweep":
+        print("O modo sweep (método da mesa) não é backtestável: depende dos níveis de cluster de cada hora "
+              "(niveis.csv) e o histórico desses níveis não existe. O que dá para fazer é acumular evidência em paper: "
+              "o robô regista cada hora no journal e o resultado de cada ordem em zec_sweep_results.csv.\n"
+              "Para testar as outras estratégias: --strategy reversal | trend | both.")
+        return 2
     p = Params.from_cfg(cfg)
 
     exchange = args.exchange or cfg.exchange
