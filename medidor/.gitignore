@@ -1,0 +1,6 @@
+# Ambiente local e caches do Python
+.venv/
+__pycache__/
+*.pyc
+# Registos do medidor: ficam so no computador de quem mede
+dados/
