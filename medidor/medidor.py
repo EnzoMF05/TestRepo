@@ -225,8 +225,12 @@ def base_da_liquidacao(it: Dict[str, Any]) -> str:
 
 
 def volume_liquidacao(it: Dict[str, Any]) -> float:
-    """Dolares de uma liquidacao. O websocket usa volume_usd; o REST v4 usa usd_value."""
-    for chave in ("volume_usd", "volumeUsd", "usd_value", "usdValue"):
+    """Dolares de uma liquidacao.
+
+    O websocket escreve volume_usd (canal liquidation_orders) ou volUsd (canal
+    liquidationOrders); o REST v4 usa usd_value.
+    """
+    for chave in ("volume_usd", "volumeUsd", "volUsd", "vol_usd", "usd_value", "usdValue"):
         v = flt(it.get(chave))
         if v == v and 0 < v < float("inf"):
             return v
@@ -249,7 +253,7 @@ def chave_liquidacao(it: Dict[str, Any]) -> Tuple[Any, ...]:
     t = int(flt(it.get("time") or 0) // 1000)
     px = flt(it.get("price") or 0)
     pxk = round(px, 2) if px >= 100 else round(px, 6)
-    ex = str(it.get("exchange") or it.get("exchange_name") or "").upper()
+    ex = str(it.get("exchange") or it.get("exchange_name") or it.get("exName") or "").upper()
     return (ex, base_da_liquidacao(it), t, pxk, lado_liquidacao(it), usd)
 
 
