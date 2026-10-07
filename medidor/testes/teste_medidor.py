@@ -1,10 +1,12 @@
 """Testes das pecas do medidor que nao precisam de rede. Correr:  python3 testes/teste_medidor.py"""
 import csv
+import json
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -231,7 +233,7 @@ class Relatorio(Base):
         md.cmd_relatorio(self.cfg)
         with open(os.path.join(self.cfg.pasta, "relatorio.txt"), encoding="utf-8") as f:
             txt = f.read()
-        self.assertIn("4 de 100 sinais medidos", txt)
+        self.assertIn("4 de 100 sinais medidos (4 completos, 2 entram na regra)", txt)
         self.assertIn("1 em que a ordem nao cabia", txt)
         # regra so nos 2 sinais com impacto viavel: R medio 5, imp 1.5, taker 4.5 -> V_ag = -1.0
         # passiva: pi = 0.5, R nos preenchidos 8, ganho 0.5, maker 1.5 -> V_pas = 3.5
@@ -276,7 +278,8 @@ class RelatorioPorTipoDeOrdem(Base):
             med.reg_fills.escrever(self.fill(i, "Open Long", 1.0, f=3.6))        # taker com desconto de staking
         med.reg_sinais.escrever({"id": "s", "ativo": "BTC", "lado": "compra", "mid0": "100", "imp_bps": "1.0",
                                  "imp_viavel": 1, "sombra_preenchida": 0, "ganho_passiva_bps": "0.5", "r_300": 8.0,
-                                 "estado": nu.VERDE, "ofi_lado": "2.0", "fresco": 1})
+                                 "estado": nu.VERDE, "ofi_lado": "2.0", "fresco": 1,
+                                 "liq_favor_usd": "50000", "liq_contra_usd": "0"})
         md.cmd_relatorio(self.cfg)
         with open(os.path.join(self.cfg.pasta, "relatorio.txt"), encoding="utf-8") as f:
             txt = f.read()
@@ -284,6 +287,7 @@ class RelatorioPorTipoDeOrdem(Base):
         self.assertIn("V agressiva 3.40", txt)                                   # 8 - (1.0 + 3.6)
         self.assertIn("  verde          n=1", txt)                               # estado no instante do sinal
         self.assertIn("  fluxo a favor  n=1", txt)
+        self.assertIn("  liq. a favor   n=1", txt)                               # liquidacoes a favor da ordem
 
     def test_um_sinal_nao_chega_para_mudar_a_rota(self):
         med = md.Medidor(self.cfg, {"BTC": 5, "ETH": 4})
@@ -395,6 +399,10 @@ class CoinGlassEHorizonte(Base):
         rest = {"exchange_name": "binance", "base_asset": "BTC", "price": 100.0, "side": 2,
                 "time": 5499, "usd_value": 1004}
         self.assertEqual(md.chave_liquidacao(ws), md.chave_liquidacao(rest))
+        camel = {"exName": "Binance", "baseAsset": "BTC", "price": 100, "side": 2,
+                 "time": 5000, "volUsd": 1000}                         # grafia do canal liquidationOrders
+        self.assertEqual(md.volume_liquidacao(camel), 1000)
+        self.assertEqual(md.chave_liquidacao(camel), md.chave_liquidacao(ws))
 
     def test_a_mesma_ordem_nao_soma_duas_vezes_e_o_lado_separa(self):
         med = md.Medidor(self.cfg, {"BTC": 5, "ETH": 4})
@@ -414,6 +422,160 @@ class CoinGlassEHorizonte(Base):
         self.assertIn("ENTRADA", md.frase_do_horizonte(300))
         self.assertIn("drift", md.frase_do_horizonte(3600))
         self.assertNotIn("ENTRADA", md.frase_do_horizonte(3600))
+
+
+class BilheteDoEstado(Base):
+    """O bilhete le o estado.json: recusa um estado velho e da o tamanho no passo da bolsa."""
+    EXTRA = ("[orcamento]\nalvo_bps = 200\n[detector]\naquecimento_min = 0.1\n"
+             "[avancado]\namostra_s = 1\npasso_historico = 1\n")
+
+    def setUp(self):
+        super().setUp()
+        self.med = md.Medidor(self.cfg, {"BTC": 5, "ETH": 4})
+        self.med.ligado = True
+        at = self.med.ativos["BTC"]
+        t = 1_000_000
+        for i in range(12):
+            t = 1_000_000 + i * 1000
+            at.on_livro(t, t, [(100.0, 5.0), (99.9, 5.0)], [(100.2, 5.0), (100.3, 5.0)])
+            at.amostrar(t)
+        self.t = t
+        self.med._escrever_estado(t)
+        with open(self.cfg.estado_json, encoding="utf-8") as f:
+            self.doc = json.load(f)
+
+    def bilhete(self, tamanho="100", agora=None, lado="compra", doc=None):
+        return md.montar_bilhete(self.cfg, doc or self.doc, "btc", lado, tamanho,
+                                 agora=self.t + 500 if agora is None else agora)
+
+    def copia(self, **campos):
+        doc = json.loads(json.dumps(self.doc))
+        doc["ativos"]["BTC"].update(campos)
+        return doc
+
+    def test_estado_fresco_da_bilhete_com_tamanho_em_unidades(self):
+        self.assertEqual(self.doc["ativos"]["BTC"]["estado"], nu.VERDE)
+        pr = self.bilhete()
+        b = pr.bilhete
+        # teto = 100,1 x (1 + 30 bps) = 100,4003, arredondado para dentro a 100,4; pior preco 100,2 cabe
+        self.assertEqual((b.rota, b.tipo, b.preco), ("agressiva", "IOC", 100.4))
+        self.assertEqual(pr.q_unidades, 0.999)                      # 100 / 100,1 = 0,99900..., 5 casas, para baixo
+        self.assertAlmostEqual(pr.usd_arredondado, 0.999 * 100.4)
+        self.assertEqual(pr.avisos, [])
+        self.assertEqual(pr.idade_ms, 500)
+
+    def test_estado_velho_ou_sem_ligacao_nao_da_bilhete(self):
+        pr = self.bilhete(agora=self.t + self.cfg.sem_dados_ms + 1)
+        self.assertEqual((pr.bilhete.rota, pr.bilhete.tipo), ("sem_dados", ""))
+        self.assertIn("nao esta a correr", pr.bilhete.nota)
+        self.assertTrue(pr.q_unidades != pr.q_unidades)
+        pr = self.bilhete(doc=dict(self.doc, ligado=False))
+        self.assertEqual(pr.bilhete.rota, "sem_dados")
+        self.assertIn("sem ligacao", pr.bilhete.nota)
+        self.assertEqual(self.bilhete(doc=dict(self.doc, hora_utc="ontem")).bilhete.rota, "sem_dados")
+        self.assertEqual(md.idade_do_estado_ms({"hora_utc": ""}, 5), sys.maxsize)
+        self.assertEqual(md.idade_do_estado_ms({"hora_utc": md.iso_utc(4000)}, 5000), 1000)
+
+    def test_tamanho_nao_enviavel_avisa_sem_mudar_a_rota(self):
+        pr = self.bilhete("5")                          # 0,04995 BTC = 5,01 usd, abaixo do minimo de 10
+        self.assertEqual(pr.bilhete.rota, "agressiva")
+        self.assertEqual(pr.q_unidades, 0.04995)
+        self.assertEqual(len(pr.avisos), 1)
+        self.assertIn("minimo", pr.avisos[0])
+        pr = self.bilhete("0.0005")                     # 0,000005 BTC arredonda a zero com 5 casas
+        self.assertEqual(pr.q_unidades, 0.0)
+        self.assertIn("zero", pr.avisos[0])
+
+    def test_fotografia_do_livro_velha_avisa_mas_nao_tira_a_rota(self):
+        pr = self.bilhete(doc=self.copia(idade_livro_ms=60_000))
+        self.assertEqual(pr.bilhete.rota, "agressiva")
+        self.assertTrue(any("fotografia" in a for a in pr.avisos))
+
+    def test_aquecimento_sem_ordem_e_vermelho_passiva(self):
+        pr = self.bilhete(doc=self.copia(estado=nu.AQUECIMENTO))
+        self.assertEqual((pr.bilhete.rota, pr.bilhete.tipo), ("aguardar", ""))
+        self.assertTrue(pr.q_unidades != pr.q_unidades)             # sem ordem nao ha tamanho
+        pr = self.bilhete(doc=self.copia(estado=nu.VERMELHO))
+        self.assertEqual((pr.bilhete.rota, pr.bilhete.tipo, pr.bilhete.preco), ("passiva", "ALO", 100.0))
+        self.assertEqual(pr.q_unidades, 0.999)
+        pr = self.bilhete(doc=self.copia(estado=nu.VERMELHO), lado="venda")
+        self.assertEqual((pr.bilhete.rota, pr.bilhete.tipo, pr.bilhete.preco), ("passiva", "ALO", 100.2))
+
+    def test_aos_100_sinais_a_medida_tira_a_travessia_e_nunca_a_da(self):
+        linha = {"ativo": "BTC", "lado": "compra", "mid0": "100", "imp_bps": "1.0", "imp_viavel": 1,
+                 "sombra_preenchida": 1, "ganho_passiva_bps": "0.5", "r_300": 8.0}
+        for i in range(99):
+            self.med.reg_sinais.escrever(dict(linha, id="s%d" % i))
+        pr = self.bilhete()
+        self.assertEqual((pr.bilhete.rota, pr.medida["n"], pr.medida["escolha"]), ("agressiva", 99, "passiva"))
+        self.med.reg_sinais.escrever(dict(linha, id="s99"))
+        pr = self.bilhete()
+        # V_ag = 8 - (1 + 4,5) = 2,5 ; V_pas = 1 x (8 + 0,5 - 1,5) = 7 -> a passiva vale mais
+        self.assertEqual((pr.bilhete.rota, pr.bilhete.tipo, pr.bilhete.preco), ("passiva", "ALO", 100.0))
+        self.assertIn("100 sinais", pr.bilhete.nota)
+        self.assertAlmostEqual(pr.medida["v_ag"], 2.5)
+        self.assertAlmostEqual(pr.medida["v_pas"], 7.0)
+        self.assertAlmostEqual(pr.medida["dif"], 4.5)
+        self.assertEqual((pr.medida["erro"], pr.medida["clara"], pr.medida["travada"]), (0.0, True, False))
+        # o contrario nao acontece: mesmo com a medida a preferir a agressiva, o vermelho fica passivo
+        for i in range(100):
+            self.med.reg_sinais.escrever(dict(linha, id="t%d" % i, sombra_preenchida=0, r_300=20.0))
+        pr = self.bilhete(doc=self.copia(estado=nu.VERMELHO))
+        self.assertEqual(pr.medida["escolha"], "agressiva")         # R medio 14, V_ag 8,5 > V_pas 3,5
+        self.assertEqual((pr.bilhete.rota, pr.bilhete.tipo), ("passiva", "ALO"))
+
+
+class BilheteComMargemExigida(BilheteDoEstado):
+    """Com regra_exige_margem = sim, uma passiva melhor so por pouco nao tira a travessia."""
+    EXTRA = "regra_exige_margem = sim\n" + BilheteDoEstado.EXTRA   # a Base ja abre a seccao [sombra]
+
+    def test_dentro_do_ruido_fica_a_rota_do_livro(self):
+        # 55 sinais com R=8 preenchidos e 45 com R=10 por preencher: V_ag 3,40, V_pas 3,85, diferenca 0,45
+        # com erro padrao 0,45 -> nao passa 2 erros padrao (0,90)
+        base = {"ativo": "BTC", "lado": "compra", "mid0": "100", "imp_bps": "1.0", "imp_viavel": 1,
+                "ganho_passiva_bps": "0.5"}
+        for i in range(100):
+            cheia = i < 55
+            self.med.reg_sinais.escrever(dict(base, id="s%d" % i, sombra_preenchida=int(cheia),
+                                              r_300=8.0 if cheia else 10.0))
+        pr = self.bilhete()
+        m = pr.medida
+        self.assertAlmostEqual(m["v_ag"], 3.4)
+        self.assertAlmostEqual(m["v_pas"], 3.85)
+        self.assertAlmostEqual(m["dif"], 0.45)
+        self.assertAlmostEqual(m["erro"], 0.45)                 # desvio amostral 4,5 / sqrt(100)
+        self.assertEqual((m["clara"], m["travada"], m["escolha"]), (False, True, "agressiva"))
+        self.assertEqual((pr.bilhete.rota, pr.bilhete.tipo), ("agressiva", "IOC"))
+        # com uma diferenca clara a medida volta a tirar a travessia
+        for i in range(100):
+            self.med.reg_sinais.escrever(dict(base, id="u%d" % i, sombra_preenchida=1, r_300=8.0))
+        pr = self.bilhete()
+        self.assertTrue(pr.medida["clara"])
+        self.assertFalse(pr.medida["travada"])
+        self.assertEqual((pr.bilhete.rota, pr.bilhete.tipo), ("passiva", "ALO"))
+
+
+class HistoricoEmDisco(Base):
+    """Ao arrancar, o medidor rele as metricas de toda a janela, nao so as de ontem e de hoje."""
+
+    def cfg_com_janela(self, horas):
+        ini = os.path.join(self.pasta, "config_%d.ini" % horas)
+        with open(ini, "w", encoding="utf-8") as f:
+            f.write("[geral]\nativos = BTC\n[detector]\njanela_horas = %d\n" % horas)
+        return md.Config(ini)
+
+    def test_janela_de_tres_dias_rele_o_ficheiro_de_anteontem(self):
+        cfg = self.cfg_com_janela(72)
+        os.makedirs(cfg.pasta_metricas, exist_ok=True)
+        anteontem = md.agora_ms() - 2 * 86_400_000
+        dia = datetime.fromtimestamp(anteontem / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+        reg = md.Registo(os.path.join(cfg.pasta_metricas, "BTC_%s.csv" % dia), md.COLUNAS_METRICAS)
+        for i in range(7):
+            reg.escrever({"hora_utc": md.iso_utc(anteontem + i * 5000), "local_ms": anteontem + i * 5000,
+                          "spread_ticks": "1", "prof_util_usd": "50000", "vol_razao": "1.0", "intens_razao": "1.0",
+                          "ofi_norm": "0.1", "mark_oraculo_bps": "1.0", "liq_60s_usd": "", "estado": nu.VERDE})
+        self.assertEqual(len(md.Medidor(cfg, {"BTC": 5}).ativos["BTC"].jan["spread"]), 7)
+        self.assertEqual(len(md.Medidor(self.cfg_com_janela(24), {"BTC": 5}).ativos["BTC"].jan["spread"]), 0)
 
 
 if __name__ == "__main__":

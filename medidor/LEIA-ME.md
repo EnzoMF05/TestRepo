@@ -110,7 +110,7 @@ Para ver um registo numa folha de cálculo, abra uma cópia. Se gravar por cima 
 bash arrancar.sh relatorio
 ```
 
-1. **Sinais e registo sombra.** Resultado médio dos sinais ao fim de 300 s, percentagem em que a ordem passiva teria preenchido, e o valor esperado de cada rota (V agressiva e V passiva, regra 6.5), comparadas nos mesmos sinais. Depois, os mesmos números separados pelo estado do livro e pelo fluxo no instante do sinal.
+1. **Sinais e registo sombra.** Resultado médio dos sinais ao fim de 300 s, percentagem em que a ordem passiva teria preenchido, e o valor esperado de cada rota (V agressiva e V passiva, regra 6.5), comparadas nos mesmos sinais. Por baixo, a diferença V passiva − V agressiva calculada sinal a sinal e o seu erro padrão: "clara" se passa 2 erros padrão, "dentro do ruído" se não. Depois, os mesmos números separados pelo estado do livro, pelo fluxo no instante do sinal e, com a chave da CoinGlass, pelas liquidações nos 60 s anteriores.
 2. **Custo por ordem.** E, F, A e D em bps, com aberturas e fechos em blocos separados, e por rota (taker ou maker). Nas aberturas, também por estado do livro: se VERMELHO custar mais do que VERDE, o detector está a avisar bem.
 3. **Tempo em cada estado.** Percentagens do dia inteiro e alarmes mais frequentes.
 
@@ -120,13 +120,19 @@ Três cuidados de leitura:
 - "Passiva preenche pelo menos X %" é um mínimo: a simulação põe a ordem no fim da fila e ignora cancelamentos à frente.
 - D só conta na primeira ordem ligada a cada sinal. Uma segunda abertura sem sinal próprio fica fora, e o relatório diz quantas foram.
 
-A primeira linha mostra o progresso: a Etapa 2 pede 100 sinais e 30 ordens de abertura. São mínimos para ler os totais; não chegam para encher todas as combinações de estado, rota e activo.
+A primeira linha mostra o progresso: a Etapa 2 pede 100 sinais e 30 ordens de abertura. Entre parênteses diz quantos sinais estão completos e quantos entram na regra: os 100 que o bilhete exige são os que entram na regra, completos e com impacto medido e viável. São mínimos para ler os totais; não chegam para encher todas as combinações de estado, rota e activo.
 
 ## 8. Bilhete
 
 Com o medidor a correr, `python3 medidor.py bilhete BTC compra 1000` imprime a ordem pronta e não a envia. O teto é um preço, `p* = mid × (1 ± B / 10⁴)`, arredondado para dentro. A rota atravessa só se o pior preço do tamanho pedido, em unidades `Q = T / mid`, ficar dentro desse teto, e o estado não for vermelho. O impacto médio é o que essa conta produz, não um segundo teste.
 
-Por baixo vem a regra medida, V agressiva contra V passiva, nos sinais completos desse activo. Com menos de 100 não muda a rota: os números são só leitura. Aos 100, se a passiva valer mais, o bilhete deixa de atravessar e fica no toque. O contrário não acontece: a medida nunca autoriza atravessar um livro que o teto ou o vermelho proibiu.
+O bilhete lê o `estado.json`. Se esse ficheiro tiver mais de `sem_dados_s` (10 s), ou tiver sido escrito com o medidor sem ligação, não há bilhete: o livro desse instante já não existe. Em aquecimento também não há ordem nenhuma, nem passiva.
+
+O tamanho sai em dólares e em unidades do activo, arredondado para baixo ao passo da bolsa (`szDecimals`), que é o número que se escreve na ordem. Se o tamanho arredondado der zero, ou ficar abaixo de `minimo_ordem_usd`, o bilhete avisa que a ordem não é enviável. Se a fotografia do livro for velha, avisa que só o melhor preço é actual.
+
+Por baixo vem a regra medida, V agressiva contra V passiva, nos sinais completos desse activo com impacto medido e viável. Com menos de 100 não muda a rota: os números são só leitura. Aos 100, se a passiva valer mais, o bilhete deixa de atravessar e fica no toque. O contrário não acontece: a medida nunca autoriza atravessar um livro que o teto ou o vermelho proibiu.
+
+A mesma regra traz a diferença V passiva − V agressiva calculada sinal a sinal e o seu erro padrão. Por defeito basta a passiva valer mais. Com `regra_exige_margem = sim` em `config.ini`, a medida só tira a travessia se a diferença passar 2 erros padrão; dentro do ruído fica a rota do livro, e o bilhete diz porquê.
 
 ## 9. Privacidade
 
@@ -134,12 +140,12 @@ Tudo fica neste computador. O medidor não envia os seus registos para lado nenh
 
 ## 10. O que foi testado e o que falta confirmar
 
-Testado: 78 testes das fórmulas e das peças, mais uma simulação com cerca de 90 conferências contra uma bolsa simulada que fala o formato documentado da Hyperliquid. Inclui queda de ligação, paragem de dados sem queda, fills parciais, sinais atrasados e paragem a meio. Corre em Python 3.9 e 3.13.
+Testado: 106 testes das fórmulas e das peças (62 do núcleo, 44 do medidor), mais uma simulação com 91 conferências contra uma bolsa simulada que fala o formato documentado da Hyperliquid. Inclui queda de ligação, paragem de dados sem queda, fills parciais, sinais atrasados, paragem a meio, o bilhete com estado velho e a regra com e sem margem. Corre em Python 3.9 e 3.13; a versão 2.5 foi conferida em 3.13 com websockets 17.
 
 Por confirmar na sua máquina:
 
 - **Ligação real à Hyperliquid.** O ambiente onde o medidor foi escrito não a alcança. `bash arrancar.sh verificar` é esse teste.
-- **CoinGlass.** A medida de liquidações só liga com a chave em `config.ini`. O plano Professional inclui o fluxo de ordens de liquidação (o mesmo que o Standard); o heatmap não é usado, porque é uma imagem e o detector precisa do fluxo. O medidor subscreve as duas grafias do canal (`liquidation_orders` e `liquidationOrders`) e, se o websocket não entregar, pede o mesmo fluxo na API REST v4. A mesma ordem não conta duas vezes. O painel mostra dois contadores: liquidações recebidas e, dessas, as dos seus activos. Em cada sinal fresco ficam também os dólares liquidados a favor e contra a ordem, nos últimos 60 s.
+- **CoinGlass.** A medida de liquidações só liga com a chave em `config.ini`. O plano Professional inclui o fluxo de ordens de liquidação (o mesmo que o Standard); o heatmap não é usado, porque é uma imagem e o detector precisa do fluxo. O medidor subscreve as duas grafias do canal (`liquidation_orders` e `liquidationOrders`), lê os campos nas duas grafias que a documentação mostra (`volume_usd` e `volUsd`) e, se o websocket não entregar, pede o mesmo fluxo na API REST v4. A mesma ordem não conta duas vezes. O painel mostra dois contadores: liquidações recebidas e, dessas, as dos seus activos. Em cada sinal fresco ficam também os dólares liquidados a favor e contra a ordem, nos últimos 60 s.
 - **Relógio.** Os custos de decisão comparam a hora do computador com a da bolsa. Mantenha a hora automática do macOS ligada.
 
 ## 11. Para quem alterar o código

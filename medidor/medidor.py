@@ -34,7 +34,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import nucleo as nu
 
-VERSAO = "2.4"
+VERSAO = "2.5"
 log = logging.getLogger("medidor")
 
 URLS = {
@@ -81,6 +81,7 @@ class Config:
         self.tamanho_usd = float(g("orcamento", "tamanho_usd", "1000"))
         self.taxa_taker = float(g("orcamento", "taxa_taker_bps", "4.5"))
         self.taxa_maker = float(g("orcamento", "taxa_maker_bps", "1.5"))
+        self.minimo_ordem_usd = float(g("orcamento", "minimo_ordem_usd", "10"))
         self.orcamento = nu.orcamento_bps(self.alvo_bps, self.fraccao)
 
         self.janela_h = float(g("detector", "janela_horas", "24"))
@@ -103,6 +104,8 @@ class Config:
         if self.h_regra not in self.horizontes:
             self.horizontes = sorted(set(self.horizontes) | {self.h_regra})
         self.janela_sinal_s = float(g("sombra", "janela_sinal_s", "900"))
+        # Com "sim", a medida so tira a travessia se V_pas - V_ag passar 2 erros padrao.
+        self.regra_exige_margem = g("sombra", "regra_exige_margem", "nao").lower() in ("sim", "s", "yes", "true", "1")
         self.horizontes_fill = sorted({int(float(x)) for x in _lista(g("sombra", "horizontes_fill_s", "5, 30, 60"))})
 
         self.painel_s = float(g("painel", "intervalo_s", "5"))
@@ -789,10 +792,11 @@ class Medidor:
     def _recarregar_historico(self) -> None:
         """Reconstroi os percentis com as metricas das ultimas horas, se existirem."""
         limite = agora_ms() - int(self.cfg.janela_h * 3600 * 1000)
+        n_dias = max(1, int(math.ceil(self.cfg.janela_h / 24.0)))  # ficheiros diarios que a janela pode tocar
         for nome, at in self.ativos.items():
             n = 0
-            for dias in (1, 0):
-                dia = (datetime.now(timezone.utc) - timedelta(days=dias)).strftime("%Y-%m-%d")
+            for atras in range(n_dias, -1, -1):
+                dia = (datetime.now(timezone.utc) - timedelta(days=atras)).strftime("%Y-%m-%d")
                 p = os.path.join(self.cfg.pasta_metricas, "%s_%s.csv" % (nome, dia))
                 if not os.path.exists(p):
                     continue
@@ -1689,9 +1693,15 @@ def cmd_relatorio(cfg: Config) -> None:
     hs = cfg.horizontes_fill
     ordens = _ordens(fills, hs)
     abre = [o for o in ordens if o["tipo"] == "abre"]
+    h = cfg.h_regra
+    col = "r_%d" % h
+    completos = [s for s in sinais if s.get(col, "") != "" and s.get("sombra_preenchida") in ("0", "1")]
+    na_regra = [s for s in completos if s.get("imp_viavel") == "1" and s.get("imp_bps", "") != ""]
     w("RELATORIO DO MEDIDOR %s  (%s)" % (VERSAO, datetime.now().strftime("%Y-%m-%d %H:%M")))
-    w("Progresso da Etapa 2: %d de 100 sinais medidos, %d de 30 ordens de abertura (%d ordens, %d fills)"
-      % (len(sinais), len(abre), len(ordens), len(fills)))
+    w("Progresso da Etapa 2: %d de 100 sinais medidos (%d completos, %d entram na regra), "
+      "%d de 30 ordens de abertura (%d ordens, %d fills)"
+      % (len(sinais), len(completos), len(na_regra), len(abre), len(ordens), len(fills)))
+    w("Os 100 sinais que o bilhete exige sao os que entram na regra: completos, com impacto medido e viavel.")
     w("")
 
     # taxas da regra: as medidas nos fills quando ha ordens que cheguem, senao as do config.ini
@@ -1705,14 +1715,11 @@ def cmd_relatorio(cfg: Config) -> None:
     f_m, origem_m = taxa(False, cfg.taxa_maker)
 
     # ---- sinais e regra passiva / agressiva (seccao 6.5)
-    h = cfg.h_regra
-    col = "r_%d" % h
     w("1. SINAIS E REGISTO SOMBRA  (horizonte %d s, prazo da passiva %.0f s)" % (h, cfg.prazo_s))
     w("   " + frase_do_horizonte(h))
     if not sinais:
         w("   Ainda nao ha sinais medidos.")
     else:
-        completos = [s for s in sinais if s.get(col, "") != "" and s.get("sombra_preenchida") in ("0", "1")]
         w("   %d sinais registados | %d sem dados de mercado | %d com resultado e registo sombra completos"
           % (len(todos_sinais), len(todos_sinais) - len(sinais), len(completos)))
         w("   %d com impacto medido | %d em que a ordem nao cabia no livro visivel | %d chegaram com mais de 2 s"
@@ -1747,8 +1754,15 @@ def cmd_relatorio(cfg: Config) -> None:
             ganho = nu.media([flt(s["ganho_passiva_bps"]) for s in ench_r]) if ench_r else float("nan")
             v_ag, v_pas, escolha = nu.regra_rotas(
                 nu.media([flt(s[col]) for s in regra]), imp, pi, r_ench, ganho, f_t, f_m)
+            dif, erro = nu.margem_regra([flt(s[col]) for s in regra], [flt(s["imp_bps"]) for s in regra],
+                                        [s["sombra_preenchida"] == "1" for s in regra],
+                                        [flt(s["ganho_passiva_bps"]) for s in regra], f_t, f_m)
             w("   %16s regra (n=%d): impacto %s bps | V agressiva %s | V passiva %s  ->  %s"
               % ("", len(regra), f2(imp), f2(v_ag), f2(v_pas), escolha.upper()))
+            w("   %16s V passiva - V agressiva = %s bps, erro padrao %s: %s"
+              % ("", f2(dif), f2(erro),
+                 "diferenca clara (passa 2 erros padrao)" if nu.margem_clara(dif, erro)
+                 else "dentro do ruido" if erro == erro else "sem erro padrao com um so sinal"))
 
         linha_grupo("TODOS", completos, True)
         if len(cfg.ativos) > 1:
@@ -1763,6 +1777,13 @@ def cmd_relatorio(cfg: Config) -> None:
             w("   Pelo fluxo de ordens no instante do sinal:")
             linha_grupo("  fluxo a favor", favor, False)
             linha_grupo("  fluxo contra", contra, False)
+        com_liq = [s for s in completos if s.get("liq_favor_usd", "") != "" and s.get("liq_contra_usd", "") != ""]
+        if com_liq:  # so com a chave CoinGlass: dolares liquidados nos 60 s antes do sinal
+            w("   Pelas liquidacoes nos 60 s antes do sinal:")
+            linha_grupo("  liq. a favor", [s for s in com_liq if flt(s["liq_favor_usd"]) > flt(s["liq_contra_usd"])], False)
+            linha_grupo("  liq. contra", [s for s in com_liq if flt(s["liq_contra_usd"]) > flt(s["liq_favor_usd"])], False)
+            linha_grupo("  sem liquidacoes",
+                        [s for s in com_liq if flt(s["liq_favor_usd"]) == 0 and flt(s["liq_contra_usd"]) == 0], False)
         w("   A passiva simulada ignora cancelamentos a frente na fila: a percentagem real de preenchimento e maior.")
         if len(completos) < 100:
             w("   Nota: com menos de 100 sinais completos estes valores sao so indicativos.")
@@ -1856,7 +1877,9 @@ def cmd_relatorio(cfg: Config) -> None:
 
 def medida_do_activo(cfg: Config, ativo: str) -> Dict[str, Any]:
     """A regra 6.5 nos sinais completos deste activo. Nao muda nada por si."""
-    vazio = {"n": 0, "completos": 0, "v_ag": float("nan"), "v_pas": float("nan"), "escolha": ""}
+    nan = float("nan")
+    vazio = {"n": 0, "completos": 0, "v_ag": nan, "v_pas": nan, "escolha": "",
+             "dif": nan, "erro": nan, "clara": False, "travada": False}
     if not os.path.exists(cfg.reg_sinais):
         return vazio
     col = "r_%d" % cfg.h_regra
@@ -1876,14 +1899,127 @@ def medida_do_activo(cfg: Config, ativo: str) -> Dict[str, Any]:
         return nu.media(fs) if len(fs) >= 5 else defeito
 
     pi = len(ench) / len(regra)
+    f_t, f_m = taxa(True, cfg.taxa_taker), taxa(False, cfg.taxa_maker)
     v_ag, v_pas, escolha = nu.regra_rotas(
         nu.media([flt(s[col]) for s in regra]),
         nu.media([flt(s["imp_bps"]) for s in regra]),
         pi,
-        nu.media([flt(s[col]) for s in ench]) if ench else float("nan"),
-        nu.media([flt(s["ganho_passiva_bps"]) for s in ench]) if ench else float("nan"),
-        taxa(True, cfg.taxa_taker), taxa(False, cfg.taxa_maker))
-    return {"n": len(regra), "completos": len(completos), "v_ag": v_ag, "v_pas": v_pas, "escolha": escolha}
+        nu.media([flt(s[col]) for s in ench]) if ench else nan,
+        nu.media([flt(s["ganho_passiva_bps"]) for s in ench]) if ench else nan,
+        f_t, f_m)
+    dif, erro = nu.margem_regra([flt(s[col]) for s in regra], [flt(s["imp_bps"]) for s in regra],
+                                [s["sombra_preenchida"] == "1" for s in regra],
+                                [flt(s["ganho_passiva_bps"]) for s in regra], f_t, f_m)
+    clara = nu.margem_clara(dif, erro)
+    travada = bool(cfg.regra_exige_margem and escolha == "passiva" and not clara)
+    if travada:  # a passiva vale mais, mas dentro do ruido: com margem exigida, fica a rota do livro
+        escolha = "agressiva"
+    return {"n": len(regra), "completos": len(completos), "v_ag": v_ag, "v_pas": v_pas, "escolha": escolha,
+            "dif": dif, "erro": erro, "clara": clara, "travada": travada}
+
+
+class BilhetePronto:
+    """Bilhete montado a partir do estado.json, com o que se imprime a volta dele."""
+
+    def __init__(self, bilhete: nu.Bilhete, nome: str, u: Dict[str, Any], medida: Dict[str, Any],
+                 idade_ms: int, q_unidades: float, usd_arredondado: float, avisos: List[str]):
+        self.bilhete = bilhete
+        self.nome = nome
+        self.u = u
+        self.medida = medida
+        self.idade_ms = idade_ms
+        self.q_unidades = q_unidades
+        self.usd_arredondado = usd_arredondado
+        self.avisos = avisos
+
+
+def idade_do_estado_ms(doc: Dict[str, Any], agora: int) -> int:
+    """Milissegundos entre a hora escrita no estado.json e agora. Sem hora legivel: sys.maxsize."""
+    hora = str(doc.get("hora_utc") or "").strip()
+    if not hora:
+        return sys.maxsize
+    try:
+        return agora - interpretar_hora(hora, 0)
+    except ValueError:
+        return sys.maxsize
+
+
+def montar_bilhete(cfg: Config, doc: Dict[str, Any], ativo: str, lado_txt: str, tamanho: str,
+                   agora: Optional[int] = None) -> BilhetePronto:
+    """Etapa 3: a ordem pronta a partir de um estado.json ja lido. Nao a envia.
+
+    Um estado com mais de sem_dados_s, ou escrito com o medidor sem ligacao, nao da
+    bilhete: o livro desse instante ja nao existe. O tamanho sai tambem em unidades do
+    activo, arredondado para baixo ao passo da bolsa (szDecimals), e o bilhete avisa se
+    a ordem assim arredondada nao for enviavel.
+    """
+    agora = agora_ms() if agora is None else agora
+    ativos = doc.get("ativos") or {}
+    nome = next((k for k in ativos if k.upper() == ativo.upper()), None)
+    if nome is None:
+        raise SystemExit("Activo %r nao esta no estado. A medir: %s" % (ativo, ", ".join(ativos)))
+    u = ativos[nome]
+    lado = nu.interpretar_lado(lado_txt)
+    tam = flt(tamanho) if tamanho else cfg.tamanho_usd
+    if not (tam == tam and tam > 0):
+        raise SystemExit("Tamanho invalido: %r" % tamanho)
+    nan = float("nan")
+    medida = medida_do_activo(cfg, nome)
+    avisos: List[str] = []
+    idade = idade_do_estado_ms(doc, agora)
+    if abs(idade) > cfg.sem_dados_ms:
+        quanto = ("%.0f s" % (idade / 1000.0)) if idade < sys.maxsize else "uma hora ilegivel"
+        b = nu.Bilhete("sem_dados", "", nan, tam,
+                       "sem livro: nao ha bilhete. O estado.json tem %s: o medidor nao esta a correr, "
+                       "ou o relogio do computador mudou." % quanto)
+        return BilhetePronto(b, nome, u, medida, idade, nan, nan, avisos)
+    if not doc.get("ligado"):
+        b = nu.Bilhete("sem_dados", "", nan, tam, "sem livro: nao ha bilhete. O medidor esta sem ligacao a bolsa.")
+        return BilhetePronto(b, nome, u, medida, idade, nan, nan, avisos)
+
+    def num_ou_nan(v: Any) -> float:
+        return nan if v is None else flt(v)
+
+    bid, ask = num_ou_nan(u.get("bid")), num_ou_nan(u.get("ask"))
+    chave_niveis = "niveis_compra" if lado > 0 else "niveis_venda"
+    niveis = []
+    for par in u.get(chave_niveis) or []:
+        if isinstance(par, (list, tuple)) and len(par) >= 2:
+            px, sz = flt(par[0]), flt(par[1])
+            if px == px and sz == sz and px > 0 and sz > 0:
+                niveis.append((px, sz))
+    estado = str(u.get("estado") or "")
+    if niveis and u.get("sz_decimals") is not None:
+        b = nu.decidir_rota(lado, tam, cfg.orcamento, estado, bid, ask, niveis, int(u["sz_decimals"]), cfg.theta)
+    else:
+        imp = num_ou_nan(u.get("imp_compra_bps") if lado > 0 else u.get("imp_venda_bps"))
+        qmax = num_ou_nan(u.get("qmax_usd_compra") if lado > 0 else u.get("qmax_usd_venda"))
+        teto = num_ou_nan(u.get("p_teto_compra") if lado > 0 else u.get("p_teto_venda"))
+        b = nu.emitir_bilhete(lado, tam, cfg.orcamento, estado, bid, ask, imp, qmax, teto)
+    if nu.rota_com_medida(b.rota, medida["n"], medida["escolha"]) != b.rota:
+        toque = bid if lado > 0 else ask
+        b = nu.Bilhete(
+            "passiva", "ALO", toque, b.tamanho_usd,
+            "o livro deixava atravessar; com %d sinais a medida prefere a passiva (V passiva %.2f, V agressiva %.2f)."
+            % (medida["n"], medida["v_pas"], medida["v_ag"]),
+            b.qmax_usd, b.imp_bps)
+    q_un = usd_r = nan
+    sz_dec = u.get("sz_decimals")
+    if (b.rota in ("agressiva", "passiva") and sz_dec is not None and b.preco == b.preco and b.preco > 0
+            and bid == bid and ask == ask and ask > bid > 0):
+        q_un = nu.arredondar_tamanho(tam / nu.mid(bid, ask), int(sz_dec))  # Q = T / mid, no passo da bolsa
+        usd_r = q_un * b.preco
+        if q_un <= 0:
+            avisos.append("o tamanho arredondado a %d casas da zero: a ordem nao e enviavel; aumente o tamanho"
+                          % int(sz_dec))
+        elif usd_r < cfg.minimo_ordem_usd:
+            avisos.append("%.2f usd fica abaixo do minimo por ordem da bolsa (%.0f usd): a ordem nao e enviavel"
+                          % (usd_r, cfg.minimo_ordem_usd))
+    idade_livro = num_ou_nan(u.get("idade_livro_ms"))
+    if b.rota in ("agressiva", "passiva") and idade_livro == idade_livro and idade_livro > cfg.sem_dados_ms:
+        avisos.append("a fotografia do livro tem %.0f s: so o melhor preco e actual, os niveis seguintes podem ter mudado"
+                      % (idade_livro / 1000.0))
+    return BilhetePronto(b, nome, u, medida, idade, q_un, usd_r, avisos)
 
 
 def cmd_bilhete(cfg: Config, ativo: str, lado_txt: str, tamanho: str) -> None:
@@ -1892,70 +2028,45 @@ def cmd_bilhete(cfg: Config, ativo: str, lado_txt: str, tamanho: str) -> None:
         raise SystemExit("Nao ha estado.json. Arranque o medidor e deixe-o a medir.")
     with open(cfg.estado_json, encoding="utf-8") as f:
         doc = json.load(f)
-    ativos = doc.get("ativos") or {}
-    u = ativos.get(ativo) or ativos.get(ativo.upper())
-    if not u:
-        raise SystemExit("Activo %r nao esta no estado. A medir: %s" % (ativo, ", ".join(ativos)))
+    pr = montar_bilhete(cfg, doc, ativo, lado_txt, tamanho)
+    b, u, med = pr.bilhete, pr.u, pr.medida
     lado = nu.interpretar_lado(lado_txt)
-    tam = flt(tamanho) if tamanho else cfg.tamanho_usd
-    if not (tam == tam and tam > 0):
-        raise SystemExit("Tamanho invalido: %r" % tamanho)
-
-    def num_ou_nan(v: Any) -> float:
-        if v is None:
-            return float("nan")
-        x = flt(v)
-        return x
-
-    chave_niveis = "niveis_compra" if lado > 0 else "niveis_venda"
-    brutos = u.get(chave_niveis) or []
-    niveis = []
-    for par in brutos:
-        if isinstance(par, (list, tuple)) and len(par) >= 2:
-            px, sz = flt(par[0]), flt(par[1])
-            if px == px and sz == sz and px > 0 and sz > 0:
-                niveis.append((px, sz))
-    if niveis and u.get("sz_decimals") is not None:
-        b = nu.decidir_rota(lado, tam, cfg.orcamento, str(u.get("estado") or ""),
-                            num_ou_nan(u.get("bid")), num_ou_nan(u.get("ask")),
-                            niveis, int(u["sz_decimals"]), cfg.theta)
-    else:
-        imp = num_ou_nan(u.get("imp_compra_bps") if lado > 0 else u.get("imp_venda_bps"))
-        qmax = num_ou_nan(u.get("qmax_usd_compra") if lado > 0 else u.get("qmax_usd_venda"))
-        teto = num_ou_nan(u.get("p_teto_compra") if lado > 0 else u.get("p_teto_venda"))
-        b = nu.emitir_bilhete(lado, tam, cfg.orcamento, str(u.get("estado") or ""),
-                              num_ou_nan(u.get("bid")), num_ou_nan(u.get("ask")), imp, qmax, teto)
-    nome = next((k for k in ativos if k.upper() == ativo.upper()), ativo)
-    med = medida_do_activo(cfg, nome)
-    if nu.rota_com_medida(b.rota, med["n"], med["escolha"]) != b.rota:
-        toque = num_ou_nan(u.get("bid") if lado > 0 else u.get("ask"))
-        b = nu.Bilhete(
-            "passiva", "ALO", toque, b.tamanho_usd,
-            "o livro deixava atravessar; com %d sinais a medida prefere a passiva (V passiva %.2f, V agressiva %.2f)."
-            % (med["n"], med["v_pas"], med["v_ag"]),
-            b.qmax_usd, b.imp_bps)
-    print("BILHETE  %s  %s %s  (medidor %s, livro de %s)" % (
-        b.rota.upper(), "compra" if lado > 0 else "venda", ativo, doc.get("versao", VERSAO), doc.get("hora_utc", "")))
+    idade = ("%.1f s" % (pr.idade_ms / 1000.0)) if pr.idade_ms < sys.maxsize else "hora ilegivel"
+    print("BILHETE  %s  %s %s  (medidor %s, livro de %s, ha %s)" % (
+        b.rota.upper(), "compra" if lado > 0 else "venda", pr.nome, doc.get("versao", VERSAO),
+        doc.get("hora_utc", ""), idade))
     print("Estado do livro: %s" % (u.get("estado") or "-"))
     if u.get("motivos"):
         print("Motivo: %s" % " | ".join(u.get("motivos") or []))
     if b.tipo:
-        print("Tipo: %s    preco: %s    tamanho: %.2f usd    validade: %.0f s" % (
-            b.tipo, ("%.8g" % b.preco) if b.preco == b.preco else "-", b.tamanho_usd, cfg.prazo_s))
+        validade = ("%.0f s" % cfg.prazo_s) if b.tipo == "ALO" else "imediata (IOC)"
+        print("Tipo: %s    preco: %s    tamanho: %.2f usd    validade: %s" % (
+            b.tipo, ("%.8g" % b.preco) if b.preco == b.preco else "-", b.tamanho_usd, validade))
+        if pr.q_unidades == pr.q_unidades:
+            casas = int(u.get("sz_decimals") or 0)
+            print("Tamanho em unidades: %s %s  (%.2f usd ao preco do bilhete; %d casas, arredondado para baixo)" % (
+                "%.*f" % (casas, pr.q_unidades), pr.nome, pr.usd_arredondado, casas))
     if b.qmax_usd == b.qmax_usd:
         print("Qmax no teto: %.0f usd    Imp(Q): %s" % (
             b.qmax_usd, ("%.2f bps" % b.imp_bps) if b.imp_bps == b.imp_bps else "-"))
     print(b.nota)
+    for aviso in pr.avisos:
+        print("AVISO: " + aviso)
     if med["n"] == 0:
         print("Medida: ainda nao ha sinais deste activo com impacto. A rota e so a do livro.")
     else:
         print("Medida aos %d s, n=%d: V agressiva %.2f | V passiva %.2f -> %s." % (
             cfg.h_regra, med["n"], med["v_ag"], med["v_pas"], med["escolha"].upper()))
+        print("V passiva - V agressiva = %.2f bps, erro padrao %s: %s." % (
+            med["dif"], ("%.2f" % med["erro"]) if med["erro"] == med["erro"] else "-",
+            "diferenca clara" if med["clara"] else "dentro do ruido"))
+        if med["travada"]:
+            print("A regra exige margem (config.ini): a passiva nao e claramente melhor, fica a rota do livro.")
         if med["n"] < nu.MINIMO_REGRA:
             print("Com menos de %d sinais nao muda a rota. Faltam %d." % (nu.MINIMO_REGRA, nu.MINIMO_REGRA - med["n"]))
     ofi = u.get("ofi_norm")
     if isinstance(ofi, (int, float)) and ofi == ofi:
-        lado_fluxo = lado * ofi
+        lado_fluxo = lado * ofi + 0.0  # +0.0 evita imprimir -0.00 numa venda com fluxo nulo
         print("Fluxo face a ordem: %+.2f (%s). Nao muda a rota." % (
             lado_fluxo, "a favor" if lado_fluxo > 0 else "contra" if lado_fluxo < 0 else "neutro"))
     print("Nao enviado. Quem envia e a pessoa. A Etapa 4 e que tem chave, e ainda nao.")

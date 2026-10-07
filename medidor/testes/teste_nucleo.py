@@ -396,7 +396,13 @@ class Bilhete(unittest.TestCase):
 
     def test_aquecimento_nao_escolhe_rota(self):
         b = nu.emitir_bilhete(1, 1000, 4.5, nu.AQUECIMENTO, 100.0, 100.2, 0.2, 9000, 100.45)
-        self.assertEqual(b.rota, "aguardar")
+        self.assertEqual((b.rota, b.tipo), ("aguardar", ""))       # sem rota nao ha ordem, nem passiva
+        self.assertTrue(math.isnan(b.preco))
+        asks = [(100.01, 100.0), (100.05, 100.0)]
+        b2 = nu.decidir_rota(1, 500, 4.5, nu.AQUECIMENTO, 99.99, 100.01, asks, 2, theta=1)
+        self.assertEqual((b2.rota, b2.tipo), ("aguardar", ""))
+        self.assertTrue(math.isnan(b2.preco))
+        self.assertAlmostEqual(b2.qmax_usd, 100.01 * 100.0)          # a conta do livro fica registada na mesma
 
     def test_rota_segue_o_pior_preco_e_nao_o_impacto_medio(self):
         # teto arredondado a 100.04. O nivel 100.05 fica de fora.
@@ -427,6 +433,29 @@ class RegraMedida(unittest.TestCase):
         self.assertEqual(v_pas, 0.0)
         self.assertEqual(escolha, "agressiva")
         self.assertAlmostEqual(v_ag, 4.5)
+
+    def test_margem_reproduz_a_regra_sinal_a_sinal(self):
+        r = [8.0, 2.0, 5.0, -3.0]
+        imp = [1.5, 1.0, 2.0, 0.5]
+        cheia = [True, False, True, False]
+        ganho = [0.5, 0.4, 0.6, 0.5]
+        f_t, f_m = 4.5, 1.5
+        ench = [i for i in range(4) if cheia[i]]
+        v_ag, v_pas, _ = nu.regra_rotas(nu.media(r), nu.media(imp), len(ench) / 4.0,
+                                        nu.media([r[i] for i in ench]), nu.media([ganho[i] for i in ench]), f_t, f_m)
+        dif, erro = nu.margem_regra(r, imp, cheia, ganho, f_t, f_m)
+        self.assertAlmostEqual(dif, v_pas - v_ag, places=12)
+        # d_i = v_pas_i - v_ag_i: 7,0-2,0 ; 0-(-3,5) ; 4,1-(-1,5) ; 0-(-8,0)  ->  5,0  3,5  5,6  8,0
+        d = [5.0, 3.5, 5.6, 8.0]
+        m = sum(d) / 4
+        self.assertAlmostEqual(erro, math.sqrt(sum((x - m) ** 2 for x in d) / 3 / 4), places=12)
+        self.assertTrue(nu.margem_clara(dif, erro))
+        self.assertFalse(nu.margem_clara(0.5, 0.3))
+        self.assertFalse(nu.margem_clara(float("nan"), 0.3))
+        self.assertTrue(math.isnan(nu.margem_regra([8.0], [1.0], [True], [0.5], 4.5, 1.5)[1]))   # um sinal: sem erro
+        self.assertTrue(all(math.isnan(x) for x in nu.margem_regra([], [], [], [], 4.5, 1.5)))
+        with self.assertRaises(ValueError):
+            nu.margem_regra([1.0, 2.0], [1.0], [True], [0.5], 4.5, 1.5)
 
     def test_a_medida_so_tira_a_travessia_e_so_depois_do_minimo(self):
         self.assertEqual(nu.rota_com_medida("agressiva", 99, "passiva"), "agressiva")

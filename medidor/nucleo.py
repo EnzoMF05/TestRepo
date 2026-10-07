@@ -412,13 +412,46 @@ def rota_com_medida(rota_livro: str, n: int, escolha: str, minimo: int = MINIMO_
     return "passiva"
 
 
+def margem_regra(r: Sequence[float], imp_bps: Sequence[float], preenchida: Sequence[bool],
+                 ganho_spread_bps: Sequence[float], taxa_taker_bps: float,
+                 taxa_maker_bps: float) -> Tuple[float, float]:
+    """V_pas - V_ag calculado sinal a sinal, e o erro padrao dessa diferenca.
+
+    Para cada sinal i: v_ag_i = R_i - (Imp_i + f_t) e v_pas_i = 1[preenchida_i] (R_i + g_i - f_m),
+    com g_i o meio spread ganho pela passiva. As medias de v_ag_i e v_pas_i sao exactamente
+    V_ag e V_pas da regra 6.5; a media de d_i = v_pas_i - v_ag_i e V_pas - V_ag, e o erro
+    padrao e desvio(d) / sqrt(n), com o desvio amostral. Com menos de 2 sinais nao ha erro
+    padrao (nan). Sem sinais, tudo nan.
+    """
+    n = len(r)
+    if not (n == len(imp_bps) == len(preenchida) == len(ganho_spread_bps)):
+        raise ValueError("as listas tem de ter o mesmo comprimento")
+    if n == 0:
+        return float("nan"), float("nan")
+    d = []
+    for ri, ii, cheia, gi in zip(r, imp_bps, preenchida, ganho_spread_bps):
+        v_ag = ri - (ii + taxa_taker_bps)
+        v_pas = (ri + gi - taxa_maker_bps) if cheia else 0.0
+        d.append(v_pas - v_ag)
+    media_d = sum(d) / n
+    if n < 2:
+        return media_d, float("nan")
+    var = sum((x - media_d) ** 2 for x in d) / (n - 1)
+    return media_d, math.sqrt(var / n)
+
+
+def margem_clara(diferenca: float, erro_padrao: float, k: float = 2.0) -> bool:
+    """A passiva so e claramente melhor se V_pas - V_ag passa k erros padrao."""
+    return diferenca == diferenca and erro_padrao == erro_padrao and diferenca > k * erro_padrao
+
+
 # --------------------------------------------------------------------------
 # Etapa 3. Bilhete: a ordem pronta, sem a enviar
 # --------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Bilhete:
     rota: str             # passiva, agressiva, aguardar, sem_dados
-    tipo: str             # ALO, IOC, ou vazio
+    tipo: str             # ALO, IOC, ou vazio (sem_dados e aguardar: nao ha ordem)
     preco: float
     tamanho_usd: float
     nota: str
@@ -447,8 +480,8 @@ def decidir_rota(lado: int, tamanho_usd: float, orcamento_bps: float, estado: st
     teto = arredondar_preco(preco_teto(m, lado, orcamento_bps), sz_decimals, lado > 0)
     imp = impacto(list(niveis), tamanho_usd / m, m, lado, theta)
     qm = tamanho_max(niveis, teto, lado, theta)
-    if estado == AQUECIMENTO:
-        return Bilhete("aguardar", "ALO", toque, tamanho_usd,
+    if estado == AQUECIMENTO:  # sem estado nao ha rota, nem a passiva: o bilhete nao traz ordem
+        return Bilhete("aguardar", "", float("nan"), tamanho_usd,
                        "aquecimento: o estado ainda nao existe, nao ha rota", qm.usd, imp.imp_bps)
     if estado == VERMELHO:
         return Bilhete("passiva", "ALO", toque, tamanho_usd,
@@ -478,8 +511,8 @@ def emitir_bilhete(lado: int, tamanho_usd: float, orcamento_bps: float, estado: 
     if not _livro_serve(estado, bid, ask):
         return Bilhete("sem_dados", "", float("nan"), tamanho_usd, "sem livro: nao ha bilhete", qmax_usd, imp_bps)
     toque = bid if lado > 0 else ask
-    if estado == AQUECIMENTO:
-        return Bilhete("aguardar", "ALO", toque, tamanho_usd,
+    if estado == AQUECIMENTO:  # sem estado nao ha rota, nem a passiva: o bilhete nao traz ordem
+        return Bilhete("aguardar", "", float("nan"), tamanho_usd,
                        "aquecimento: o estado ainda nao existe, nao ha rota", qmax_usd, imp_bps)
     if estado == VERMELHO:
         return Bilhete("passiva", "ALO", toque, tamanho_usd,
