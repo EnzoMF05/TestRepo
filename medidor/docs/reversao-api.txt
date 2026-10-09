@@ -1,0 +1,413 @@
+=== API (88) ===
+- [reversao.py] lambda_ancora(h_a: float) -> float  :: Factor da ancora exponencial a partir da meia-vida em velas de 1 h; ValueError se h_a <= 0.
+    
+    formula: (1) lambda_A = 2^(-1/h_A)
+- [reversao.py] class Ancora(h_a: float): juntar(x: float) -> float; valor: float; n: int  :: EWMA causal do log-preco com correccao de arranque (nucleo.Ewma); devolve o desvio d apos juntar.
+    
+    formula: (2)(3) A_t = EWMA_{h_A}(x)_t ; d_t = x_t - A_t
+- [reversao.py] ajustar_ar1(d: Sequence[float], lam_a: float) -> AjusteOU  :: AR(1) sem intercepto em janela N; dataclass frozen com phi_hat, phi_c, s2, se_rob, t_nulo, theta, meia_vida, sigma_eq, theta_x, se_theta, n, valido; nan se N < 
+    
+    formula: (6)-(14) phi_hat = S_xy/S_xx ; phi_c = phi_hat(1+2/N) ; e_t = d_t - phi_c d_{t-1} ; SE_rob = sqrt(sum d_{t-1}^2 e_t^2)/S_xx ; t_nulo = (phi_c - lambda_A)/SE_rob ; H = ln2/(-ln phi_c) ; sigma_eq = sqrt
+- [reversao.py] sigma_retorno(r: Sequence[float]) -> float  :: Desvio padrao do retorno horario na janela do ajuste.
+    
+    formula: (15) sigma_r = sqrt(sum r_t^2 / N)
+- [reversao.py] calibrar_t_crit(n: int, lam_a: float, replicas: int = 1000, alpha: float = 0.001, semente: int = 7) -> float  :: Quantil alpha de t_nulo sob passeio aleatorio simulado com random.Random(semente); determinista; cerca de -3,3 para N = 720.
+    
+    formula: (11) t_crit = quantil_alpha(t_nulo | nula, N, lambda_A)
+- [reversao.py] racio_variancias(r: Sequence[float], q: int) -> Tuple[float, float]  :: VR(q) de Lo-MacKinlay e z* robusto a heteroscedasticidade; ValueError se q < 2 ou len(r) < 2q.
+    
+    formula: (16)-(21) VR = sigma_q^2/(q sigma_1^2) ; z* = sqrt(N)(VR-1)/sqrt(theta_q), theta_q = sum_j [2(q-j)/q]^2 delta_j
+- [reversao.py] z_simples_vr(vr: float, q: int, n: int) -> float  :: Estatistica homoscedastica do VR, so para o teste de implementacao.
+    
+    formula: (22) z = (VR-1)/sqrt(2(2q-1)(q-1)/(3qN))
+- [reversao.py] parkinson(h: float, l: float) -> float  :: Variancia de Parkinson de uma vela; ValueError se h < l ou l <= 0.
+    
+    formula: (23) rp = (ln(h/l))^2/(4 ln 2)
+- [reversao.py] class VolParkinson(h_curta: float, h_longa: float): juntar(h: float, l: float) -> None; sigma_15: float; vol_razao: float  :: EWMA curta e longa de rp em velas de 15 m.
+    
+    formula: (24)(25) sigma_15 = sqrt(EWMA_{96}(rp)) ; vol_razao_15 = sqrt(EWMA_8(rp)/EWMA_96(rp))
+- [reversao.py] veto_dia(x_t: float, x_abertura: float, sigma_r: float, k_dia: float) -> bool  :: Veto de sobre-reaccao diaria; k_dia = 0 desliga.
+    
+    formula: (26)(27) |x_t - x_00UTC| > k_dia sigma_r sqrt(24)
+- [reversao.py] z_score(ln_c: float, a: float, sigma_eq: float) -> float  :: Desvio padronizado de um fecho (1 h ou 15 m) face a ancora em vigor; nan se sigma_eq nao e positivo.
+    
+    formula: (28)(36) z = (ln c - A)/sigma_eq
+- [reversao.py] niveis(a: float, sigma_eq: float, z: float) -> Tuple[float, float]  :: Precos das bandas inferior e superior a z sigma_eq.
+    
+    formula: (29) exp(A -+ z sigma_eq)
+- [reversao.py] quantil_abs_z(zs: Sequence[float], p: float = 0.954) -> float  :: Quantil empirico de |z| sobre velas anteriores (o chamador exclui a vela corrente).
+    
+    formula: (30) q_z = quantil_p(|z_s|), s < t
+- [reversao.py] z_in_efectivo(z_in: float, q_z: float, z_in_emp_max: float) -> float  :: Banda de entrada efectiva; alarga ao quantil empirico se as caudas forem pesadas.
+    
+    formula: (31) z_in_ef = z_in se q_z <= z_in_emp_max senao q_z
+- [reversao.py] z_robusto(x: float, historico: Sequence[float]) -> float  :: Z por mediana e MAD; nan se MAD = 0 ou historico vazio.
+    
+    formula: (32) (x - mediana)/MAD
+- [reversao.py] oi_usd(open_interest: float, mark_px: float) -> float  :: Open interest em dolares (H3).
+    
+    formula: (33) OI = openInterest x markPx
+- [reversao.py] premio_bps(mark: float, oraculo: float) -> float  :: Premio local mark menos oraculo em bps.
+    
+    formula: (34) pm = BPS (mark - oraculo)/oraculo
+- [reversao.py] classificar_contexto(aj: AjusteOU, vr: float, z_vr: float, vol_razao: float, veto_dia: bool, t_crit: float, cfg: ParametrosContexto) -> Contexto  :: Estado VERDE/AMARELO/VERMELHO com lista de motivos (nulo, vr, meia_vida, vol, dia, ajuste).
+    
+    formula: (35)
+- [reversao.py] k_maximo(meia_vida: float, k_h: float, tecto: int) -> int  :: Duracao maxima da excursao em velas de 15 m, escalada pela meia-vida.
+    
+    formula: (37) k_max = min(tecto, round(8 k_H H_0))
+- [reversao.py] class Excursao: actualizar(z: float, z_in_ef: float) -> None; estado: str; ext: float; k_fora: int; lado_exc: int; oi_inicio: float; terminou_mesmo_lado: bool  :: Maquina de estados DENTRO/FORA por activo; guarda ext, k_fora e lado_exc; marca o fim da excursao e o lado em que terminou.
+    
+    formula: seccao 5.2
+- [reversao.py] gatilho_reentrada(estado_prev: str, lado_exc: int, ext: float, k_fora: int, k_max: int, z_prev: float, z_k: float, z_in_ef: float, r_k: float, sigma_15: float, vol_razao_15: float, cfg: ParametrosGatilho) -> Tuple[int, str]  :: Condicoes G2 a G5 no fecho k; devolve (lado ou 0, motivo da primeira condicao que falhou ou 'ok').
+    
+    formula: G2: FORA_{k-1} e |z_k| < z_in_ef e sign(z_k) = lado_exc e |z_k| < |z_{k-1}| ; G3: |z_k| >= z_out + z_min_resto ; G4: ext < z_veto e k_fora <= k_max ; G5: |r_k| <= k_choque sigma_15 e vol_razao_15 <= v
+- [reversao.py] lado_agressor(side: str) -> int  :: +1 para B, -1 para A; ValueError para outro texto.
+    
+    formula: s_i = +1 [side = B] - 1 [side = A]
+- [reversao.py] agressor(users: Sequence[str], s: int) -> Tuple[str, str]  :: (agressor, passivo) a partir de users = [comprador, vendedor] (H2); strings vazias se users faltar.
+    
+    formula: agr = users[0] se s = +1 senao users[1]
+- [reversao.py] hash_endereco(endereco: str) -> str  :: Prefixo de 10 caracteres do sha256 do endereco em minusculas; nunca se guarda o endereco inteiro.
+    
+    formula: h = sha256(endereco)[:10]
+- [reversao.py] class FluxoAgressor(janela_ms: int): negocio(t_ms: int, s: int, ntl: float) -> None; v_b(agora_ms: int) -> float; v_a(agora_ms: int) -> float; ofi(agora_ms: int) -> float  :: Somas moveis por lado (nucleo.JanelaSoma) e OFI normalizado; nan sem volume.
+    
+    formula: (38)(39) OFI = (V_B - V_A)/(V_B + V_A)
+- [reversao.py] class NegociosGrandes(n_max: int, p: float, janela_24h_ms: int): negocio(t_ms: int, s: int, ntl: float, h_agr: str, h_pas: str, px: float, hash_zero: bool) -> None; q99() -> float; flx(agora_ms: int) -> float; repetidos(agora_ms: int, excluidos: Set[str]) -> int; rajada_contra(agora_ms: int, lado: int, silencio_s: float, dt_ms: int, amp_bps: float) -> bool; twap(agora_ms: int, lado: int, cfg: ParametrosTwap) -> Tuple[int, str]; hhi_passivo(p_inf: float, p_sup: float, t0_ms: int, t1_ms: int) -> float  :: Quantil 0,99 do notional em 24 h, fluxo dos grandes, enderecos repetidos, rajadas de liquidacao e TWAP por hash a zeros e cadencia, HHI do lado passivo na zona 
+    
+    formula: (41)-(44),(47)-(49)
+- [reversao.py] absorcao_residual(r_hist: Sequence[float], u_hist: Sequence[float], r_k: float, u_k: float, lado: int) -> Tuple[float, float, float]  :: Regressao sem intercepto do retorno de 15 m sobre o fluxo normalizado nas 96 velas anteriores; devolve (beta, s_e, a_k); nan com menos de 24 velas.
+    
+    formula: (45)(46) beta = sum r u/sum u^2 ; a_k = lado (r_k - beta u_k)/s_e
+- [reversao.py] posicoes_baleias(posicoes: Sequence[Posicao], preco: float, lado: int, pct_fuel: float, oi_usd: float, faixa_bps: float, p_min_exc: float, p_max_exc: float) -> Tuple[float, float, int]  :: POS liquido, FUEL normalizado por OI e bandeira iman a partir das posicoes sondadas (Posicao = coin, szi, position_value, liquidation_px); nan/0 com lista vazia
+    
+    formula: (50)-(52)
+- [reversao.py] racio_liquidacoes(liq_contra_15m: float, max_excursao: float) -> float  :: Fraccao das liquidacoes contrarias face ao maximo da excursao; nan sem chave.
+    
+    formula: (53) liq = LIQ_contra_k / max_exc LIQ_contra
+- [reversao.py] pontuar_baleias(lado: int, flx: float, pos_flx: float, rep: int, z_f: float, doi_exc: float, liq: float, dpos: float, pos_dpos: float, twap: int, a_k: float, u_k: float, pos_doi8: float, cfg: ParametrosBaleias) -> Tuple[int, Dict[str, int]]  :: B_k e o dicionario dos termos T1 a T8; nan em qualquer entrada da 0 nesse termo.
+    
+    formula: (54) B_k = T1+...+T8, cada um em {-1,0,+1}
+- [reversao.py] factor_tamanho(b: int, fuel_oi: float, cfg: ParametrosBaleias) -> float  :: f_B por patamares de B_k, reduzido a 0,5 se FUEL/OI > pct_fuel.
+    
+    formula: (55) f_B = 0,5 se B <= 0 ; 1,0 se 1..2 ; 1,25 se >= 3
+- [reversao.py] tempo_maximo(meia_vida: float, n_h: float, tmax_h: float) -> Tuple[float, int]  :: (tau_max em velas de 1 h, tmax_15 em velas de 15 m).
+    
+    formula: (56) tau_max = min(n_H H_0, tmax_h) ; tmax_15 = round(4 tau_max)
+- [reversao.py] factor_captura(phi: float, lam_a: float) -> float  :: Fraccao do fecho do desvio que e preco e nao deriva da ancora; 0 sob a nula.
+    
+    formula: (57) rho = 1 - phi(1-lambda_A)/(lambda_A(1-phi))
+- [reversao.py] alvo_bps(d0: float, sigma0: float, phi0: float, lam_a: float, tau_max: float, z_out: float) -> float  :: Esperanca condicional do ganho em bps ate ao tempo maximo, limitada pela banda de saida.
+    
+    formula: (58) G = BPS min(rho |d0| (1 - phi0^tau_max), |d0| - z_out sigma0)
+- [reversao.py] stop_bps(z0: float, sigma0: float, z_stop: float) -> float  :: Distancia ao stop em bps; ValueError se |z0| >= z_stop.
+    
+    formula: (59) L = BPS (z_stop - |z0|) sigma0
+- [reversao.py] preco_stop(a0: float, sigma0: float, lado: int, z_stop: float) -> float  :: Nivel do stop em preco.
+    
+    formula: (59) P_stop = exp(A0 - lado z_stop sigma0)
+- [reversao.py] invalidar(t_nulo: float, vr: float, z_vr: float, z_abs: float, desloc_alvo_sigma: float, cfg: ParametrosContexto) -> Optional[str]  :: Motivo de invalidacao no fecho de 1 h durante o trade, ou None.
+    
+    formula: (60)
+- [reversao.py] funcao_escala(z: float, passos: int = 200) -> float  :: Integral de exp(u^2/2) de 0 a z por Simpson.
+    
+    formula: (61) S(z)
+- [reversao.py] prob_alvo_antes_stop(z0: float, z_out: float, z_stop: float) -> float  :: Probabilidade teorica do OU padronizado; 0,899 para (1,9; 0,5; 3).
+    
+    formula: (62) P = (S(z_stop) - S(|z0|))/(S(z_stop) - S(z_out))
+- [reversao.py] class TradeVirtual(lado: int, p_entrada: float, p_alvo: float, p_stop: float, tmax_15: int, imp_bps: float): avancar(vela: Vela, mark_min: float, mark_max: float, f_hora: float) -> Optional[Saida]; invalidar(motivo: str, p_fecho: float) -> Saida; mae_bps: float; mfe_bps: float  :: Fecha por alvo (fecho passa o nivel), stop (minimo/maximo ou mark toca; preenchido no nivel com deslize), tempo ou invalidacao; alvo e stop na mesma vela contam
+    
+    formula: seccao 7.5 ; (77)
+- [reversao.py] disjuntores(r_liq_dia: Sequence[float], stops_seguidos: int, r_liq_ultimos: Sequence[float], g_med: float, l_med: float, cfg: ParametrosDisjuntores) -> Optional[str]  :: Motivo do disjuntor disparado (perdas_dia, seguidas, cvar) ou None.
+    
+    formula: (63)
+- [reversao.py] funding_esperado_bps(lado: int, f_hora: float, tau_max_h: float) -> float  :: Funding esperado durante o trade; positivo = custo; F > 0 e pago pelos longs.
+    
+    formula: (64) f_esp = lado F BPS tau_max
+- [reversao.py] custos_defeito(taxa_taker: float, taxa_maker: float, imp_bps: float, f_esp: float) -> Tuple[float, float]  :: (c_W, c_L) de defeito ate haver custos medidos.
+    
+    formula: (65) c_W = t_t + imp + t_m + f_esp ; c_L = t_t + imp + t_t + imp + f_esp
+- [reversao.py] wilson_inferior(p_hat: float, n: int, z: float = 1.96) -> float  :: Limite inferior do intervalo de Wilson; nan se n = 0.
+    
+    formula: (68)
+- [reversao.py] margem_decisao(p_hat: float, n: int, m_min: float = 0.05, z: float = 1.96) -> float  :: Margem sobre p* que cresce com a incerteza da estimativa.
+    
+    formula: (69) m = max(m_min, z sqrt(p(1-p)/n))
+- [reversao.py] kelly_fraccao(p_inf: float, g_bps: float, l_bps: float, c_w: float, c_l: float) -> float  :: Fraccao de Kelly da aposta binaria; <= 0 sse p_inf <= p*.
+    
+    formula: (70) b = (G - c_W)/(L + c_L) ; f* = (p_inf(b+1) - 1)/b
+- [reversao.py] dimensionar(e_usd: float, g_bps: float, l_bps: float, c_w: float, c_l: float, p_hat: float, n: int, sigma_r: float, f_b: float, day_ntl_vlm: float, qmax_usd: float, cfg: ParametrosTamanho) -> Tamanho  :: Tamanho(usd, n_kelly, n_risco, n_vol, n_liq, p_estrela, p_inf, margem, f_estrela, fase, cap); fase cal devolve tamanho_base; fase sombra devolve usd = 0.
+    
+    formula: (66)-(76) N_kelly = k f* E BPS/(L+c_L) ; N_risco = r E BPS/(L+c_L) ; N_vol = v E/(sigma_r sqrt 24) ; N_liq = min(0,01 vlm/96, qmax) ; tamanho = clamp(f_B min(...), minimo, 0,25 E)
+- [reversao.py] alavancagem_maxima(l_bps: float, max_leverage: float) -> float  :: Alavancagem a que a distancia ao liquidationPx proprio e pelo menos 5 L.
+    
+    formula: lev_max = 1/(5 L/BPS + 1/(2 maxLeverage))
+- [reversao.py] hash_variante(params: Dict[str, float]) -> str  :: 6 caracteres do sha256 dos parametros ordenados por nome, com 6 casas.
+    
+    formula: sha256(json ordenado)[:6]
+- [reversao.py] nota_sinal(campos: Dict[str, object]) -> str  :: Nota ASCII 'revou v=2 chave=valor ...' sem virgulas, aspas nem quebras; nan vira 'na'; floats com 2 a 4 casas.
+    
+    formula: seccao 9
+- [reversao.py] interpretar_nota(nota: str) -> Dict[str, str]  :: Inverso de nota_sinal; dicionario vazio se o primeiro token nao for revou.
+    
+    formula: seccao 9
+- [reversao.py] vela_fechada(t_ms: int, T_ms: int, agora_ms: int, atraso_ms: int, folga_ms: int) -> bool  :: A vela esta fechada pelo relogio corrigido.
+    
+    formula: agora - atraso >= T + folga
+- [reversao.py] agregar_1h(velas_15m: Sequence[Vela]) -> Vela  :: Quatro velas de 15 m alinhadas a hora numa vela de 1 h (so para verificar contra o canal 1h).
+    
+    formula: o = o_1, h = max h, l = min l, c = c_4, v = sum v, n = sum n
+- [reversao.py] resultado_trade(lado: int, p_entrada: float, p_saida: float, funding_bps: float, custo_bps: float) -> Tuple[float, float]  :: (r_bruto, r_liq) em bps.
+    
+    formula: (77) r_bruto = BPS lado ln(p_saida/p_entrada) ; r_liq = r_bruto - custo - funding
+- [reversao.py] sharpe_trade(r: Sequence[float]) -> Tuple[float, float, float]  :: (SR, assimetria g3, curtose bruta g4) por trade; nan com n < 3.
+    
+    formula: (78) SR = media/sd
+- [reversao.py] psr(sr: float, sr_ref: float, n: int, g3: float, g4: float) -> float  :: Probabilistic Sharpe Ratio com Phi por math.erf.
+    
+    formula: (79)
+- [reversao.py] sharpe_max_esperado(m: int, var_sr: float) -> float  :: SR* esperado do maximo de M configuracoes.
+    
+    formula: (80)
+- [reversao.py] pbo_cscv(matriz: Sequence[Sequence[float]], s: int = 16) -> float  :: Probability of Backtest Overfitting por CSCV com somas por bloco (matriz trades x configuracoes); ValueError se s impar ou menos de s linhas.
+    
+    formula: (81) PBO = fraccao de lambda = ln(w/(1-w)) <= 0
+- [reversao.py] phi_normal(x: float) -> float ; phi_inversa(p: float) -> float  :: Funcao de distribuicao normal por erf e a sua inversa por bisseccao (1e-10).
+    
+    formula: Phi(x) = (1 + erf(x/sqrt 2))/2
+- [reversao.py] simular_gbm(n: int, sigma_r: float, semente: int) -> List[float]  :: Trajectoria de log-preco de passeio aleatorio gaussiano com random.Random(semente), determinista.
+    
+    formula: x_t = x_{t-1} + sigma_r eps_t
+- [reversao.py] p_nulo_rotulo(g_bps: float, l_bps: float, tmax_15: int, sigma_15: float, n_caminhos: int, semente: int) -> float  :: Taxa de acerto do rotulo alvo-antes-de-stop sob GBM para a mesma geometria.
+    
+    formula: seccao 11.6
+- [reversao.py] sessao_utc(ms: int) -> Tuple[str, int, int]  :: (sessao em {asia, europa, eua, fds}, dia da semana 0..6, hora UTC) para a nota.
+    
+    formula: asia 00-07, europa 07-13, eua 13-22, resto asia; sabado e domingo = fds
+- [sinalizador.py] class ConfigSinalizador(caminho: str)  :: md.Config mais a seccao [sinalizador] em dataclasses de parametros; SystemExit em portugues se invalido; avisa se horizontes_s nao inclui 900, 3600 e 14400; cg_
+    
+    formula: seccao 12
+- [sinalizador.py] class Vela(t: int, T: int, o: float, h: float, l: float, c: float, v: float, n: int, completa: bool)  :: Dataclass frozen; interpretar_vela(msg: dict) -> Vela le o formato do canal candle (H1).
+    
+    formula: seccao 3.1
+- [sinalizador.py] class Historico(ativo: str, intervalo: str, pasta: str): carregar_snapshot(cfg) -> int; juntar(vela: Vela) -> None; ultimas(n: int) -> List[Vela]; guardar(vela: Vela, extra: Dict[str, object]) -> None  :: Velas em memoria e em dados/velas/<ATIVO>_<intervalo>_<dia>.csv (so acrescenta; colunas enriquecidas no 15 m).
+    
+    formula: seccao 11.1
+- [sinalizador.py] class ActivoSinal(nome, cfg, sz_decimals): fecho_1h(vela: Vela) -> Contexto; fecho_15m(vela: Vela, agora_ms: int) -> Tuple[Optional[Sinal], str]; negocio(neg: dict, local_ms: int) -> None; contexto_activo(ctx: dict) -> None; liquidacao(it: dict, t_ms: int) -> None; posicoes(lista: Dict[str, List[Posicao]]) -> None; avancar_trade_virtual(vela: Vela) -> Optional[dict]; corte(t_ms: int) -> None  :: Estado por activo: Ancora, AjusteOU, Contexto, VolParkinson, Excursao, FluxoAgressor, NegociosGrandes, historico de funding/OI/premio, baleias, trade virtual, z
+    
+    formula: seccoes 4 a 8
+- [sinalizador.py] class Sinalizador(cfg): arrancar() ; parar() ; tarefa_hyperliquid() ; tarefa_relogio() ; tarefa_coinglass() ; tarefa_baleias() ; tarefa_estado() ; _tratar(msg: dict) ; _vigia(ws) ; _passo(nome: str, fn, *args)  :: Ciclo asyncio com ligacao propria (candle 15m e 1h, trades, activeAssetCtx), relogio de fechos com atraso corrigido, CoinGlass e sonda de baleias opcionais, est
+    
+    formula: seccoes 5.1 e 10
+- [sinalizador.py] escrever_sinal(cfg, sinal: Sinal) -> int  :: Espelho de cmd_sinal com alvo_bps e tamanho_usd: modo a, um write terminado em \n, fecho imediato; devolve ms da escrita e regista a latencia decisao-escrita.
+    
+    formula: seccao 9
+- [sinalizador.py] ler_estado_medidor(cfg, agora_ms: int) -> Optional[dict]  :: estado.json com idade e ligado; None (e med=off na nota) se ausente, com mais de sem_dados_s ou desligado; aviso no log.
+    
+    formula: seccao 10
+- [sinalizador.py] custos_medidos(cfg, ativo: str) -> Tuple[float, float, int]  :: (c_W, c_L, n_aberturas) a partir do registo_fills.csv e do relatorio do medidor; defeitos se n < 30.
+    
+    formula: (65)
+- [sinalizador.py] carregar_baleias(caminho: str) -> List[str] ; construir_baleias(cfg, leaderboard: List[dict], negocios_24h: Dict[str, Tuple[float, float]], liquidados_7d: Set[str], excluidos: Set[str]) -> List[str] ; sondar_baleias(cfg, enderecos: List[str]) -> Dict[str, List[Posicao]]  :: Lista diaria com os filtros da seccao 6.5 (so prefixo e hash em ficheiro) e sonda clearinghouseState em thread com orcamento de peso (400 por minuto no maximo).
+    
+    formula: seccao 6.5
+- [sinalizador.py] cmd_correr(cfg) ; cmd_verificar(cfg) ; cmd_historico(cfg) ; cmd_baleias(cfg) ; cmd_relatorio(cfg) ; cmd_ensaios(cfg) ; cmd_reset(cfg) ; main(argv=None)  :: CLI com --config; verificar confere H1 a H8 e imprime OK/AVISO/FALHA; historico descarrega candleSnapshot e fundingHistory; relatorio junta registo_sinalizador.
+    
+    formula: seccoes 3.2, 7.6, 11.5
+- [backtest_reversao.py] carregar_velas(pasta: str, ativo: str, intervalo: str) -> List[Vela] ; carregar_funding(pasta: str, ativo: str) -> Dict[int, float]  :: Le dados/velas/ e dados/funding/ (ou candleSnapshot via cmd_historico); verifica contiguidade e marca buracos.
+    
+    formula: seccao 11.3
+- [backtest_reversao.py] class Params(z_in, z_out, z_stop, n_h, z_min_resto, k_h, ...) com hash() -> str ; class Custos(taxa_taker, taxa_maker, imp_bps, pi_passiva, meio_spread_bps)  :: Dataclasses da grelha e dos custos; os parametros fora da grelha vem de config.ini.
+    
+    formula: seccao 11.4
+- [backtest_reversao.py] simular(params: Params, velas_1h: List[Vela], velas_15m: List[Vela], funding: Dict[int, float], custos: Custos, colunas_baleias: Optional[List[dict]] = None, degradada_1h: bool = False, portao: bool = True, rota: str = 'agressiva') -> List[Trade]  :: Motor por eventos com as funcoes de reversao.py e a ordem 1 h antes de 15 m; convencoes conservadoras da seccao 11.2; portao=False so para o nulo GBM.
+    
+    formula: (77)
+- [backtest_reversao.py] metricas(trades: Sequence[Trade], c_w: float, c_l: float) -> dict  :: n, expectancia, EP, p_hat, p_inf, p_estrela, margem, PF, ganho/perda, quantis, MAE, MFE, DD, perdas seguidas, duracao, motivos, SR, g3, g4.
+    
+    formula: seccao 11.5
+- [backtest_reversao.py] janelas_walk_forward(n_velas: int, is_velas: int, oos_velas: int, purga_velas: int, embargo_frac: float) -> List[Tuple[int, int, int, int]]  :: Janelas rolantes (is_ini, is_fim, oos_ini, oos_fim) com purga e embargo.
+    
+    formula: seccao 11.3
+- [backtest_reversao.py] walk_forward(grelha: List[Params], dados: Dados, cfg) -> dict  :: Por janela: escolha no IS pelo centro de um patamar (patamar(resultados) -> Params), resultado no OOS; mediana OOS, fraccao positiva, WFE, serie OOS encadeada; 
+    
+    formula: seccao 11.4
+- [backtest_reversao.py] registar_ensaio(caminho: str, params: Params, met: dict) -> None  :: Acrescenta a dados/ensaios.csv todas as configuracoes corridas, incluindo as descartadas (M do DSR).
+    
+    formula: seccao 11.4
+- [backtest_reversao.py] dsr(sr_lista: Sequence[float], sr_escolhido: float, n: int, g3: float, g4: float) -> float ; pbo(matriz: Sequence[Sequence[float]], s: int = 16) -> float  :: Deflated Sharpe Ratio e PBO a partir de reversao.psr, sharpe_max_esperado e pbo_cscv.
+    
+    formula: (79)-(81)
+- [backtest_reversao.py] nulo_gbm(params: Params, sigma_r: float, sigma_15: float, n_caminhos: int, semente: int, custos: Custos) -> dict  :: Distribuicao da expectancia bruta e liquida sob passeio aleatorio com o portao desligado (media bruta deve ser zero) e p_nulo do rotulo.
+    
+    formula: seccao 11.6
+- [backtest_reversao.py] placebo_ancora(params: Params, dados: Dados, n_real: int, semente: int, custos: Custos) -> dict  :: A mesma regra com a ancora deslocada u velas (u uniforme em [48, 240]) em n_real realizacoes; expectancia e EP do placebo.
+    
+    formula: seccao 11.6
+- [backtest_reversao.py] consistencia_4_trocos(trades: Sequence[Trade], n_trocos: int = 4) -> List[float]  :: Expectancia por troco cronologico.
+    
+    formula: seccao 11.7 (7)
+- [backtest_reversao.py] aceitacao(resultados: dict, cfg) -> Tuple[bool, List[str]]  :: Aplica os 8 criterios da seccao 11.7 e devolve os motivos de falha.
+    
+    formula: seccao 11.7
+- [backtest_reversao.py] relatorio_texto(resultados: dict) -> str ; main(argv=None)  :: Relatorio em texto por activo e variante; argparse --config, --ativo, --de, --ate, --grelha, --walk, --nulo, --placebo, --degradada-1h, --rota.
+    
+    formula: seccao 11
+- [testes/teste_reversao.py] class AncoraEAjuste ; class Nula ; class RacioVariancias ; class Bandas ; class Gatilho ; class AlvoStopTempo ; class Baleias ; class Dimensionamento ; class Nota ; class Validacao ; class NuloGBM  :: unittest das formulas com valores a mao e series sinteticas (ver plano_testes).
+    
+    formula: seccao 14
+- [testes/teste_sinalizador.py] class Base(setUp, tearDown, ler) ; class Config ; class Velas ; class EscritaDeSinais ; class Avaliacao ; class TradeVirtual ; class Disjuntores ; class Convivencia ; class Privacidade ; class Relatorio  :: unittest sem rede com pasta temporaria e config.ini minimo ([geral], [sombra], [sinalizador]).
+    
+    formula: seccao 14
+- [testes/simulacao_sinalizador.py] class BolsaComVelas(Bolsa) ; class InfoFalso ; class LeaderboardFalso ; servir_candle_snapshot(req) ; cenario_fecho_normal() ; cenario_fecho_com_atraso() ; cenario_corte_na_vela() ; cenario_rearranque() ; cenario_frescura() ; cenario_medidor_parado() ; cenario_coinglass_falsa() ; confere(cond, texto) ; main()  :: Ponta a ponta com a bolsa falsa do medidor estendida; medidor e sinalizador em processos separados sobre a mesma pasta dados; precisa de websockets (so no Mac a
+    
+    formula: seccao 14
+
+=== PARAMETROS (88) ===
+- [[sinalizador]] h_a = 96 | Meia-vida da ancora em velas de 1 h | h_A >= 4 H_max para que rho fique acima de 0,75 em toda a gama de H; deriva da ancora pequena durante o trade
+- [[sinalizador]] n_ajuste = 720 | Janela de partida do AR(1) em velas de 1 h | 30 dias; IC de theta com largura cerca de 35 por cento (medido em OU sintetico); abaixo o IC explode, acima mistura regi
+- [[sinalizador]] n_min = 480 | Janela minima para o ajuste ser valido | 20 dias; abaixo o teste nao tem potencia
+- [[sinalizador]] n_max = 2160 | Janela maxima, atingida a medida que o historico cresce | 90 dias; compromisso com a nao-estacionaridade
+- [[sinalizador]] calibrar_nula = sim | Calibrar t_crit por simulacao da nula no arranque | Com N(1 - lambda_A) perto de 5 a estatistica t nao e normal; o quantil simulado (-3,3 a -3,4) e o limiar honesto
+- [[sinalizador]] alpha_nula = 0.001 | Nivel do quantil de t_crit | Equivalente ao -3 de Harvey, Liu e Zhu numa normal; cobre varios activos e reestimacoes horarias
+- [[sinalizador]] replicas_nula = 1000 | Replicas da simulacao da nula | Erro do quantil 0,001 aceitavel; menos de 2 s por activo
+- [[sinalizador]] semente_nula = 7 | Semente de random.Random na calibracao | Determinismo bit a bit
+- [[sinalizador]] t_nulo_max = -3.0 | Limiar de t_nulo quando a calibracao esta desligada | Limiar de factores novos; ligeiramente permissivo face ao calibrado
+- [[sinalizador]] t_amarelo = -2.0 | Fronteira do estado AMARELO | Regista-se o que se perde entre -2 e t_crit sem sinalizar
+- [[sinalizador]] q_vr = 8 | Horizonte q do racio de variancias | Uma meia-vida tipica em velas de 1 h
+- [[sinalizador]] vr_max_verde = 1.0 | VR(8) tem de ficar abaixo disto para VERDE | Reversao implica VR < 1; nao se exige significancia por falta de potencia
+- [[sinalizador]] vr_veto = 1.2 | VR(8) acima disto, com z* > zvr_veto, veta | Tendencia estatisticamente clara
+- [[sinalizador]] zvr_veto = 2.0 | z* robusto minimo para o veto de tendencia | 5 por cento unilateral
+- [[sinalizador]] h_min = 3 | Meia-vida minima em velas de 1 h | Abaixo e microestrutura e ressalto bid-ask
+- [[sinalizador]] h_max = 24 | Meia-vida maxima em velas de 1 h | Acima e mais lento do que o horizonte de 16 h; exige phi_c 4,7 desvios abaixo de lambda_A sob a nula
+- [[sinalizador]] h_vc = 8 | Meia-vida curta da EWMA de Parkinson (velas de 15 m) | 2 h: escala da cascata
+- [[sinalizador]] h_vl = 96 | Meia-vida longa da EWMA de Parkinson (velas de 15 m) | 1 dia: mesma razao curta/longa do medidor em velas
+- [[sinalizador]] vol_razao_max = 2.0 | Maximo de sigma_curta/sigma_longa de 15 m | Acima e regime de cascata e a estimativa do OU nao vale
+- [[sinalizador]] k_choque = 4 | Multiplo de sigma_15 acima do qual a vela de reentrada e choque | Probabilidade 6e-5 sob normal; um choque na vela de reentrada e cascata em curso
+- [[sinalizador]] k_dia = 2 | Desvios padrao do retorno do dia que vetam | Sobre-reaccao diaria de Caporale e Plastun; 0 desliga
+- [[sinalizador]] z_in = 2.0 | Banda de entrada em sigma_eq | P(|z| > 2) = 4,6 por cento das velas sob OU gaussiano; histerese de Chan
+- [[sinalizador]] z_out = 0.5 | Banda de saida em sigma_eq | A ultima meia sigma e a mais lenta e dominada por microestrutura
+- [[sinalizador]] z_stop = 3.0 | Banda do stop em sigma_eq | Stop a cerca de 1,1 sigma da entrada; G/L perto de 1,2
+- [[sinalizador]] z_veto = 4.0 | Extensao maxima da excursao | Probabilidade 6e-5 sob o modelo: quebra de regime, nao oportunidade
+- [[sinalizador]] n_z = 720 | Janela rolante do quantil empirico de |z| | 30 dias; calculado sem a vela corrente
+- [[sinalizador]] z_in_emp_max = 2.5 | Se o quantil 0,954 de |z| passar isto, z_in_ef = quantil | Caudas pesadas; o percentil certo e o 95,4 e nao o 97,7
+- [[sinalizador]] z_min_resto = 0.75 | Caminho minimo ate z_out, em sigma | Para G pagar os custos; sem isto a reversao ja aconteceu
+- [[sinalizador]] k_h = 1 | Duracao maxima da excursao em pares de meias-vidas (k_max = 8 k_H H_0 velas de 15 m) | Duas meias-vidas; escala com H em vez de 16 velas fixas
+- [[sinalizador]] k_max_tecto = 64 | Tecto de k_max em velas de 15 m | 16 h
+- [[sinalizador]] n_h = 2 | Tempo maximo em meias-vidas | 75 por cento do caminho esperado; o resto custa funding e tempo
+- [[sinalizador]] tmax_h = 16 | Tecto do tempo maximo em horas | Acima de 16 h o trade sai do horizonte 14400 do medidor e paga funding de mais
+- [[sinalizador]] folga_fecho_ms = 1500 | Folga apos T para declarar a vela fechada pelo relogio | Cobre a propagacao da ultima vela sem atrasar a escrita alem de 1 s
+- [[sinalizador]] atraso_max_ms = 3000 | Atraso local menos bolsa maximo para avaliar (G0) | Acima disto o fecho nao e do instante que se julga
+- [[sinalizador]] idade_ctx_max_min = 75 | Idade maxima do contexto de 1 h (G0) | Um contexto com mais de uma hora e um fecho perdido
+- [[sinalizador]] rajada_dt_ms = 1000 | Intervalo maximo entre negocios do mesmo agressor num bloco | As fatias de uma liquidacao de mercado saem no mesmo bloco
+- [[sinalizador]] rajada_amp_bps = 2 | Amplitude minima de preco dentro do bloco | Substitui a contagem de niveis do livro, que o sinalizador nao subscreve
+- [[sinalizador]] rajada_silencio_s = 60 | Segundos sem rajada contraria antes de entrar | Dois arrefecimentos de 30 s da liquidacao parcial seguida da posicao inteira
+- [[sinalizador]] twap_min_negocios = 4 | Negocios minimos do mesmo agressor para TWAP | Quatro fatias cobrem 2 minutos no modo de 30 s
+- [[sinalizador]] twap_janela_s = 600 | Janela de deteccao do TWAP | 10 minutos: um TWAP curto ainda e visivel
+- [[sinalizador]] twap_dt_min_s = 10 | Intervalo minimo entre fatias | Modo aleatorio da Hyperliquid espalha de 10 a 50 s
+- [[sinalizador]] twap_dt_max_s = 50 | Intervalo maximo entre fatias | Idem
+- [[sinalizador]] q_grande = 0.99 | Quantil do notional que define negocio grande | Relativo ao proprio activo; BTC e kPEPE nao se comparam em dolares
+- [[sinalizador]] n_grandes_max = 20000 | Amostras do JanelaPercentil do notional | Cobre 24 h de negocios em BTC
+- [[sinalizador]] limiar_flx = 0.3 | |FLX_1h| minimo para T1 | Arbitrario e congelado; so o relatorio o promove
+- [[sinalizador]] limiar_rep = 2 | |REP_1h| minimo para T2 | Dois enderecos insistentes liquidos
+- [[sinalizador]] limiar_fz = 1.0 | |z_F| minimo para T3 | Um MAD de funding; a distribuicao tem picos
+- [[sinalizador]] limiar_liq = 0.5 | liq_k abaixo disto conta cascata esgotada (T4) | Metade do pico da excursao; -1 acima de 0,8
+- [[sinalizador]] limiar_abs = 1.0 | Residuo padronizado minimo para T7 | Um desvio do residuo da regressao fluxo-preco
+- [[sinalizador]] pct_fuel = 0.02 | Distancia ao liquidationPx que conta como combustivel; FUEL/OI acima disto reduz f_B a 0,5 | Dois por cento e a distancia que uma vela de 15 m extrema percorre
+- [[sinalizador]] pos_alto = 0.8 | Percentil alto de FLX e dPOS | O mesmo p_amarelo do medidor
+- [[sinalizador]] pos_baixo = 0.1 | Percentil baixo de dOI8 para T8 | Decil inferior das quedas de OI em 2 h; 0 ate haver 960 valores
+- [[sinalizador]] b_veto = -2 | B_k igual ou abaixo disto veta a entrada | Evidencia contraria forte; e o unico bloqueio por baleias
+- [[sinalizador]] fb_baixo = 0.5 | f_B com B_k <= 0 | Metade do tamanho sem confirmacao
+- [[sinalizador]] fb_alto = 1.25 | f_B com B_k >= b_alto | Nunca acima de 1,25: as baleias nao tem evidencia
+- [[sinalizador]] b_alto = 3 | B_k a partir do qual f_B = fb_alto | Tres tacticas concordantes
+- [[sinalizador]] enderecos_excluidos = 0xdfc24b077bc1425ad1dea75bcb6f8158e10df303;0x2e3d94f0562703b25c83308a05046ddaf9a8dd14 | HLP e cofre liquidador, excluidos de REP, lista e sonda | Confirmados por vaultDetails no verificar
+- [[sinalizador]] baleias_max = 100 | Enderecos sondados por clearinghouseState | 200 de peso por 15 min, abaixo dos 400 por minuto reservados ao sinalizador
+- [[sinalizador]] sonda_s = 900 | Cadencia da sonda de posicoes | Uma vez por vela de 15 m
+- [[sinalizador]] baleia_valor_min_usd = 1e6 | accountValue minimo | Mesmo limiar das posicoes de baleia da CoinGlass
+- [[sinalizador]] baleia_vlm_racio_max = 50 | vlm_month/accountValue maximo | Exclui market makers por rotacao
+- [[sinalizador]] baleia_direcc_min = 0.30 | |N_24|/G_24 minimo nos negocios | Quem compra e vende por igual fornece liquidez, nao direccao
+- [[sinalizador]] baleia_liq_dias = 7 | Dias sem liquidacao exigidos | Exclui martingales recem-liquidados
+- [[sinalizador]] capital_usd = 20000 | E, capital de referencia | So quem opera o sabe; fica neste ficheiro
+- [[sinalizador]] k_kelly = 0.25 | Fraccao de Kelly | 44 por cento do crescimento maximo com 6 por cento da variancia; p esta estimado com erro de 0,05 a n = 100
+- [[sinalizador]] risco_por_trade = 0.005 | Fraccao do capital perdida num stop, custos incluidos | Cinco perdas seguidas custam 2,5 por cento
+- [[sinalizador]] vol_alvo_dia = 0.01 | Volatilidade diaria do capital por posicao | Escala inversa a volatilidade (Moreira e Muir; Harvey et al.)
+- [[sinalizador]] liq_fraccao = 0.01 | Fraccao do volume medio de uma vela de 15 m | Tecto de liquidez proprio quando o medidor esta parado
+- [[sinalizador]] tamanho_base = 1000 | Tamanho em fase cal | O tamanho de referencia do medidor: impacto comparavel entre sinais
+- [[sinalizador]] tamanho_max_frac = 0.25 | Tecto por sinal em fraccao de E | Quatro posicoes no maximo sem o Kelly mandar
+- [[sinalizador]] expo_max = 0.75 | Soma dos tamanhos abertos em fraccao de E | Tres perps correlacionados com BTC sao quase um so trade
+- [[sinalizador]] n_cal = 30 | Trades virtuais fechados antes de sair da fase cal | Erro padrao de p_hat de 0,09 a n = 30; abaixo Kelly nao tem sentido
+- [[sinalizador]] m_min = 0.05 | Margem minima de p_inf sobre p* | Erro padrao de p a n = 100
+- [[sinalizador]] g_min_x_custo = 3 | G minimo em multiplos de c_L | Com c_L = 13 exige G >= 39 bps; abaixo p* passa de 0,6
+- [[sinalizador]] custo_taxa_entrada_bps = 4.5 | Taxa taker de defeito | Escalao base da Hyperliquid; substituida pela medida
+- [[sinalizador]] imp_defeito_bps = 2 | Impacto de defeito por lado | Substituido por imp_ref_bps do medidor
+- [[sinalizador]] c_w_bps = 8 | Custo de um trade ganho sem funding | 4,5 + 2 + 1,5
+- [[sinalizador]] c_l_bps = 13 | Custo de um trade perdido sem funding | 4,5 + 2 + 4,5 + 2
+- [[sinalizador]] perdas_dia_x_g = 3 | Disjuntor diario em multiplos da mediana de G | Tres alvos perdidos num dia e regime errado
+- [[sinalizador]] perdas_seguidas = 5 | Stops consecutivos que param o activo | Probabilidade abaixo de 3 por cento com p = 0,5
+- [[sinalizador]] cvar_x_l = 2 | CVaR dos 5 por cento piores em multiplos da mediana de L | Perdas maiores do que o stop sao gaps: parar ate reset
+- [[sinalizador]] arrefecimento_velas = 2 | Velas de 15 m sem nova entrada apos um stop | Nao reentrar na excursao que continua
+- [[sinalizador]] veto_sessao = (vazio) | Sessoes desligadas (asia, europa, eua, fds) | So apos o relatorio mostrar expectancia negativa com 2 erros padrao numa sessao
+- [[sinalizador]] pasta_velas = dados/velas | Pasta das velas e colunas enriquecidas | Ficheiro proprio, nunca o do medidor
+- [[sinalizador]] url_leaderboard = https://stats-data.hyperliquid.xyz/Mainnet/leaderboard | Fonte da lista de baleias sem chave | Nao documentada; so se muda para a simulacao
+- [[sombra]] horizontes_s = 5, 30, 60, 300, 900, 3600, 14400 | Horizontes do medidor a usar com o sinalizador | 3600 e 14400 sao a escala do trade; o sinalizador avisa se faltarem
+- [[sombra]] horizonte_regra_s = 3600 | Horizonte da regra passiva/agressiva do medidor | A regra aos 300 s mede a entrada, nao o trade
+- [[coinglass]] chave = (vazio) | Chave da API, opcional | Sem chave T4 vale 0 e liq = na; nunca em registos nem na nota
+
+=== PLANO DE TESTES (22) ===
+- teste_reversao.AncoraEAjuste: Ancora coincide com nucleo.Ewma de meia-vida h_a; dA_t = ((1 - lambda)/lambda) d_t a 1e-12; ajustar_ar1 sobre AR(1) sintetico com phi e sigma conhecidos devolve phi_c e sigma_eq dentro de 3 erros padrao; devolve nan com N < 3 e valido = False com phi_c fora de (0, 1).
+- teste_reversao.Nula: 200 trajectorias de passeio aleatorio (simular_gbm) com N = 720 e h_a = 96 dao media de phi_c - lambda_A dentro de 0,001 e t_nulo com media em [-0,5, 0,8]; rho(phi = lambda_A) = 0 exactamente; calibrar_t_crit e determinista bit a bit (duas chamadas iguais) e devolve um valor em 
+- teste_reversao.RacioVariancias: em passeio aleatorio homoscedastico z*(8) coincide com z_simples(8) a menos de 5 por cento em 100 replicas; VR(8) perto de 1 em passeio aleatorio e abaixo de 0,7 em OU com H = 8; ValueError com q < 2.
+- teste_reversao.Bandas: niveis simetricos em log; quantil_abs_z de uma normal sintetica a 0,954 fica em [1,9, 2,1]; z_in_efectivo so substitui acima de z_in_emp_max; parkinson de uma vela com h = l da 0 e ValueError com h < l; VolParkinson com velas constantes da vol_razao = 1.
+- teste_reversao.Gatilho: a maquina Excursao so devolve reentrada depois de um fecho FORA; nao dispara duas vezes na mesma excursao; nao dispara quando a excursao termina do lado oposto; k_maximo escala com H e respeita o tecto; gatilho_reentrada devolve o motivo da primeira condicao que falha (G2 a G
+- teste_reversao.AlvoStopTempo: alvo_bps nunca excede BPS (|d0| - z_out sigma0); alvo_bps = 0 sob a nula (rho = 0); stop_bps = BPS (3 - 1,9) sigma0 e ValueError com |z0| >= z_stop; tempo_maximo respeita tmax_h; prob_alvo_antes_stop(1,9, 0,5, 3) = 0,899 a 0,005 e funcao_escala(0) = 0; invalidar devolve
+- teste_reversao.TradeVirtualTeste: com velas sinteticas fecha por alvo so quando o fecho passa o nivel (a maxima nao chega), por stop quando a minima toca (preenchido no stop com deslize), por tempo ao fim de tmax_15 velas, por invalidacao ao fecho; alvo e stop na mesma vela contam stop; MAE e MFE co
+- teste_reversao.Baleias: lado_agressor e agressor conforme H2; hash_endereco com 10 caracteres e sem o endereco; FluxoAgressor expira pela janela; NegociosGrandes: Q99 correcto, FLX em [-1, 1], repetidos exclui a lista e os market makers, rajada_contra detecta um bloco de 3 negocios em 900 ms com not
+- teste_reversao.Dimensionamento: acerto_equilibrio(131, 110, 8, 13) = 0,5; wilson_inferior(0,56, 100) em [0,46, 0,47]; kelly_fraccao <= 0 quando p_inf <= p*; margem_decisao cresce com n pequeno e nunca abaixo de m_min; dimensionar com o exemplo da seccao 8.5 devolve N_kelly = 48780, N_risco = 8130, N
+- teste_reversao.Nota: nota_sinal nao contem virgulas, aspas nem quebras de linha, comeca por 'revou', nan vira na; interpretar_nota(nota_sinal(c)) devolve os mesmos valores em texto; hash_variante e estavel a ordem das chaves e muda com um parametro; sessao_utc classifica fins de semana e sessoes.
+- teste_reversao.Validacao: phi_normal(phi_inversa(p)) = p a 1e-6; psr e sharpe_max_esperado com os numeros do dossier; pbo_cscv perto de 0,5 numa matriz sem edge e perto de 0 com edge claro; ValueError com s impar; resultado_trade com os sinais certos para compra e venda; agregar_1h reproduz uma vela
+- teste_reversao.NuloGBM: a regra inteira (contexto com portao desligado, gatilho, trade virtual, custos) sobre 200 trajectorias GBM de 15 m com semente fixa da expectancia bruta media dentro de 2 erros padrao de zero e liquida igual a menos os custos: e o teste de ausencia de lookahead; o resultado e
+- teste_sinalizador.Config: config.ini minimo com [geral], [sombra] e [sinalizador] carrega com os defeitos; parametro invalido (z_out >= z_in, h_min > h_max, capital <= 0) da SystemExit com mensagem em portugues; horizontes_s sem 3600 produz aviso no log; a chave da CoinGlass nao aparece em repr nem 
+- teste_sinalizador.Velas: interpretar_vela le o formato documentado e recusa campos em falta; vela_fechada com atraso e folga; carregar_snapshot a partir de JSON gravado em disco; guardar acrescenta ao CSV diario com as colunas enriquecidas; velas de 1 h e de 15 m com fecho comum actualizam o context
+- teste_sinalizador.EscritaDeSinais: escrever_sinal cria o cabecalho so quando o ficheiro esta vazio, escreve uma linha completa de 7 campos terminada em \n, com hora iso_utc com Z e milissegundos, alvo_bps com 1 casa e tamanho_usd inteiro; nunca trunca o ficheiro; activo fora de [geral] ativos e recu
+- teste_sinalizador.Avaliacao: ActivoSinal.fecho_15m com contexto construido a mao devolve o motivo G0..G8 da primeira condicao que falha; uma entrada por excursao; arrefecimento de 2 velas apos stop; recusa quando a soma dos abertos passa expo_max; fase sombra nao escreve mas regista o trade virtual.
+- teste_sinalizador.TradeVirtual: avancar_trade_virtual com velas sinteticas escreve em registo_sinalizador.csv uma linha com motivo alvo, stop, tempo ou invalidacao, r_bruto, funding e r_liq; p_hat e p_inf recalculados a partir do registo; migracao de colunas sem perder linhas (Registo do medidor).
+- teste_sinalizador.Disjuntores: perdas do dia, cinco stops seguidos e CVaR param a emissao sem fechar o trade virtual; reset levanta; o estado persiste em estado_sinalizador.json escrito de forma atomica (tmp + os.replace).
+- teste_sinalizador.Convivencia: ler_estado_medidor devolve None e med=off com estado.json ausente, com mais de 10 s ou ligado = false, e o sinal escreve-se na mesma; custos_medidos devolve defeitos com menos de 30 aberturas; o sinalizador nunca abre em escrita registo_sinais.csv, registo_fills.csv, e
+- teste_sinalizador.Privacidade: baleias.csv so tem prefixo e hash; a chave da CoinGlass nao aparece em nenhum ficheiro de dados nem no log depois de uma tarefa_coinglass falhada.
+- teste_sinalizador.Relatorio: cmd_relatorio junta registo_sinalizador.csv com um registo_sinais.csv do medidor construido a mao, agrupa pela nota (var, ctx, bal, flx, fz, liq, ses), mostra expectancia com erro padrao, p_hat com Wilson, p* com custos medidos e a margem de 2 EP, e o ECE por caixas de z
+- simulacao_sinalizador (so no Mac): cenario_fecho_normal gera exactamente uma linha fresca em sinais.csv lida pelo medidor com fresco = 1 em menos de 1 s apos T; cenario_fecho_com_atraso espera pela folga; cenario_corte_na_vela nao gera sinal e marca a vela invalida; cenario_rearranque nao reemite o 
+
+=== PLANO BACKTEST ===
+ Dados: candleSnapshot de 1 h (5000 velas, cerca de 208 dias) e de 15 m (5000 velas, cerca de 52 dias) por activo, mais fundingHistory por hora, guardados por sinalizador.py historico em dados/velas/ e dados/funding/ para a amostra crescer desde o primeiro dia; as colunas enriquecidas (fluxo, grandes, rajadas, TWAP, OI, premio, liquidacoes, posicoes) sao gravadas ao vivo e so existem a partir do arranque. Motor: backtest_reversao.simular percorre as velas por eventos com as mesmas funcoes de reversao.py do processo ao vivo e a mesma ordem de actualizacao (1 h antes de 15 m), sem logica duplicada; a vela corrente nunca entra na ancora, no ajuste nem no quantil empirico; z_prev e o valor registado. Custos: entrada ao fecho da vela de reentrada mais metade do spread mediano (do medidor ou 1 bp) mais imp (imp_ref_bps mediano do medidor ou 2 bps) na rota agressiva (taker 4,5 bps), ou maker 1,5 bps com probabilidade de preenchimento pi (registo sombra do medidor por activo, senao 0,6) na rota passiva, entrando a taker na vela seguinte se nao preencher e a condicao se mantiver; alvo so conta se o fecho passar o nivel; stop conta se a minima ou maxima tocar, preenchido ao nivel com deslize imp; alvo e stop na mesma vela contam stop; saida no alvo a maker, no stop, tempo e invalidacao a taker + imp; funding por hora inteira dentro do trade com sinal (longs pagam F > 0); custos medidos pelo medidor (E + F + A + D por rota) substituem os defeitos com 30 aberturas. Variantes: A (so velas e funding, backtestavel desde ja), 1h-degradada (gatilho avaliado nos fechos de 1 h, para os 208 dias, assinalada), B (termos de baleias, so no periodo recolhido ao vivo com pelo menos 60 dias). Walk-forward: janelas rolantes IS 90 dias e OOS 30 dias (4 janelas em 208 dias de 1 h; 9 com um ano de 15 m), purga igual a tmax_h e embargo de 1 por cento; com 52 dias de 15 m nao ha janela completa e o backtest de 15 m e um ensaio de sanidade de uma janela ate o historico chegar a 120 dias. Grelha: so com n >= 200 trades por activo; z_in {1,8; 2,0; 2,2}, z_out {0,25; 0,5}, z_stop {2,75; 3,0; 3,5}, n_h {1,5; 2; 3}, z_min_resto {0,5; 0,75}, k_h {0,75; 1} = 216 configuracoes, todas em dados/ensaios.csv incluindo as descartadas (M do DSR); h_a, N, t_crit e limiares das baleias fora da grelha; escolha no IS pelo centro de um patamar, nunca o maximo. Metricas por trade sem anualizacao: n, expectancia com erro padrao, p_hat e p_inf de Wilson, p* por rota, PF, ganho/perda, quantis 5 e 95, MAE, MFE, drawdown em bps e perdas seguidas, duracao, motivos de saida, sinais por dia e custo diario, WFE, IC de Spearman entre z0 e r_liq, ECE e Brier de P_teo por caixas de z0, SR por trade, DSR com M de ensaios.csv, PBO por CSCV com S = 16 e somas por bloco. Nulos: GBM com o portao desligado (1000 caminhos, sigma_r do activo, semente fixa): expectancia bruta estatisticamente zero e liquida igual a menos os custos, senao ha lookahead ou erro; p_nulo = taxa de acerto do rotulo alvo-antes-de-stop sob GBM para o mesmo (G, L, tmax_15) com 10 000 caminhos; placebo de ancora deslocada (A_{t-u}, u uniforme em [48, 240] velas, 10 realizacoes) ou bandas de outro activo. Aceitacao por activo no OOS encadeado: n >= 100; p_inf > max(p*, p_nulo) + 0,05 com custos medidos; t da expectancia >= 3; mediana OOS > 0 e >= 60 por cento de janelas positivas; WFE >= 0,5; PBO < 0,2 e DSR >= 0,95; acima do quantil 0,95 do GBM e do placebo com 2 erros padrao; os 4 trocos com o mesmo sinal; ao vivo, apos 100 sinais medidos, r_3600 medio menos custos dentro de 2 erros padrao do backtest. Activos que falham ficam desligados em config.ini; revalidacao de 30 em 30 dias com o historico acrescido. Determinismo: toda a aleatoriedade por random.Random(semente); dois backtests com os mesmos dados e semente produzem ficheiros identicos.
+
+=== SO AO VIVO ===
+- Lado agressor (side B/A) e enderecos (users) dos negocios: OFI, V_B e V_A por vela, negocios grandes (Q99), FLX_1h, REP_1h, HHI do lado passivo, CVD desde o inicio da excursao; a Hyperliquid nao da historico de negocios pela API (so o arquivo S3 requester pays, fora da Etapa 1).
+- Rajadas de liquidacao inferidas dos negocios (bloco do mesmo agressor, notional >= Q99, amplitude >= 2 bps) e o veto de 60 s de silencio (G6): so se mede com o canal trades ao vivo.
+- TWAP de baleia por hash a zeros e cadencia de 10 a 50 s (T6), e a confirmacao da hipotese H5.
+- Absorcao residual a_k (regressao do retorno de 15 m sobre o fluxo agressor normalizado nas 96 velas anteriores, T7): precisa de V_B e V_A por vela.
+- Open interest, funding ao segundo e premio do activeAssetCtx por vela de 15 m: dOI_exc, dOI8 (T8), pm; a Hyperliquid nao da historico de OI (o backtest so tem fundingHistory por hora).
+- Posicoes e liquidationPx das baleias sondadas por clearinghouseState: POS, dPOS (T5), FUEL, imanes de 25 bps (iman); a lista diaria do leaderboard ou da CoinGlass e a sua qualidade (direccionalidade, liquidados em 7 dias).
+- Liquidacoes da CoinGlass por lado (LIQ_contra, liq_k, T4) e a confirmacao de que a Hyperliquid esta no fluxo (H7); sem chave o termo vale 0.
+- Custos reais de execucao medidos pelo medidor (E, F, A, D por rota e activo), probabilidade de preenchimento pi da passiva nas reentradas e o estado do livro no instante do sinal: substituem os defeitos de c_W, c_L e imp e sao a unica verdade sobre p*.
+- Atraso local menos bolsa, ordem de users, unidade do openInterest, formato do canal candle (H1 a H4, H8): so o comando verificar na maquina do utilizador os confirma.
+- Diferenca entre a saida virtual ao fecho da vela e a saida real executada a mao, e o toque do stop ao mark sem o livro la chegar.
+- A pontuacao B_k inteira e o factor f_B (variante B): so avaliaveis no periodo gravado desde o arranque, com o relatorio do sinalizador a cruzar bal, flx, fz, liq e ses com r_3600 e r_14400 do medidor; o backtest da variante B so existe quando houver pelo menos 60 dias de colunas enriquecidas.
+
+=== LIMITES ===
+- A hipotese central (reversao em excesso face ao passeio aleatorio, phi_c significativamente abaixo de lambda_A) pode nao existir em perps da Hyperliquid em 2026; o portao fecha e o sinalizador cala-se, o que e correcto e inutil; so o backtest e os 100 sinais medidos dizem se ha estrategia.
+- theta e mal estimado: com 720 velas o intervalo de H tem cerca de 35 por cento de largura; alvo, tempo maximo e k_max herdam esse erro e alvo_bps pode estar 30 por cento errado como orcamento do medidor.
+- O teste t_nulo esta em regime proximo da raiz unitaria (N(1 - lambda_A) perto de 5); o limiar calibrado por simulacao cobre inovacoes gaussianas e volatilidade estocastica, nao todas as formas de heteroscedasticidade; com H_max = 24 o tecto da meia-vida e, na pratica, o portao que mais fecha e o tes
+- Nao-estacionaridade: phi, sigma_eq e o funding mudam de regime em dias; a janela movel e o veto de VR reagem com atraso de dezenas de velas; o BOCPD ficou fora da Etapa 1 e e a primeira adicao a considerar se as perdas se concentrarem apos quebras.
+- A estrategia e de intervalo (ancora de 96 h, sigma_eq de dias), nao de reversao intradiaria; a evidencia citada e de BTC spot em 2021 e de outras bolsas, nenhuma da Hyperliquid; a direccao e ambigua em sobre-reaccoes diarias e o veto diario cobre parte, nao tudo.
+- Custos: 13 bps de ida e volta sobem p* para 0,50 com G perto de 130; o fecho de 15 m coincide com a rajada de quarto de hora e com o pior estado do livro; se a rota passiva do medidor nao preencher nas reentradas, o edge pode desaparecer no impacto.
+- Caudas: as bandas assumem inovacoes gaussianas; o quantil empirico corrige z_in mas nao o stop ao mark em gaps; o mark (mediana de tres fontes) pode tocar o stop sem o livro la chegar; P_teo = 0,90 e uma referencia que o stop por tempo e as caudas baixam muito.
+- Baleias: nenhuma tactica tem evidencia revista por pares; os limiares sao arbitrarios e congelados; o leaderboard e sobrevivencia e nao e documentado; H2, H3 e H5 sao inferencias; o endereco pode ser cobertura, market maker, isco ou martingale; so entram no tamanho, mas um f_B errado custa dinheiro 
+- Sobre-ajuste: 216 configuracoes por activo e tres activos; o PBO de uma unica realizacao sem edge varia entre 0,19 e 0,71; a grelha so corre com n >= 200 e, mesmo assim, afinar os limiares das baleias depois de ver o relatorio e o maior risco humano do projecto; as escolhas de desenho (ancora EWMA, 
+- Amostra: 52 dias de velas de 15 m no arranque, nenhuma janela de walk-forward completa, cerca de 0,8 reentradas por dia e por activo sob o modelo e menos ao vivo com o portao; 100 trades por activo demoram meses; ate la tudo e provisorio e o tamanho fica em calibracao.
+- Dependencias de API nao confirmadas a partir deste ambiente (H1 a H8: formato candle e candleSnapshot, ordem de users, unidade do OI, funding por hora, hash a zeros, leaderboard, CoinGlass com Hyperliquid, atraso); cada uma tem um teste em verificar e uma degradacao, mas um formato diferente deixa o
+- A ancora exponencial e uma decisao de modelo; outra ancora (AVWAP por ponto de mudanca, media de 24 h) daria outro universo de parametros e cada escolha conta como ensaio.
+- O sinalizador nao gere a posicao real: as saidas sao virtuais; quem opera executa-as a mao (a Etapa 4 nao existe) e a diferenca entre a saida virtual ao fecho e a real e um custo nao medido; a alavancagem da conta nao e conhecida e a nota so avisa (lev_max).
+- Tres perps correlacionados com BTC: tres sinais na mesma hora sao quase um so trade; expo_max limita, mas o n efectivo e menor do que o contado e a expectancia trata-os como independentes.
+- Rate limit partilhado com o medidor: a sonda de 100 enderecos e as subscricoes cabem, mas religacoes em rajada ou um leaderboard pesado podem derrubar o medidor; o orcamento de 400 de peso por minuto e conservador mas nao e imposto pela bolsa.
+- Velas oficiais podem ser corrigidas por negocios atrasados depois de o sinalizador as ter declarado fechadas (folga de 1,5 s); o registo guarda a vela usada na decisao e a vela final, e a divergencia e uma metrica do relatorio, nao um erro corrigido a posteriori.
