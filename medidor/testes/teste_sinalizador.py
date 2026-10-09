@@ -1692,5 +1692,34 @@ class Correccoes(Base):
         self.assertEqual(s.ativos["BTC"].liq_long.soma(T0 + 1000), 2000.0)
 
 
+class Notificacao(Base):
+    """A notificacao do macOS nunca para o ciclo e nao corre sem osascript."""
+
+    def test_sem_osascript_nao_corre_nada(self):
+        with mock.patch.object(sn.shutil, "which", return_value=None):
+            self.assertFalse(sn.notificar_mac("t", "x", correr=lambda *a, **k: self.fail("nao devia correr")))
+
+    def test_com_osascript_corre_o_guiao_sem_aspas_nem_quebras(self):
+        vistos = []
+        with mock.patch.object(sn.shutil, "which", return_value="/usr/bin/osascript"):
+            ok = sn.notificar_mac('Sinal "BTC"', 'compra\n1000 usd \\ fim', correr=lambda cmd, **k: vistos.append((cmd, k)))
+        self.assertTrue(ok)
+        cmd, k = vistos[0]
+        self.assertEqual(cmd[:2], ["osascript", "-e"])
+        self.assertEqual(cmd[2], 'display notification "compra1000 usd  fim" with title "Sinal BTC" sound name "Glass"')
+        self.assertEqual(k.get("timeout"), 5)
+
+    def test_falha_do_comando_nao_levanta_e_fica_no_log(self):
+        def rebenta(*a, **k):
+            raise OSError("sem permissao")
+        with mock.patch.object(sn.shutil, "which", return_value="/usr/bin/osascript"):
+            self.assertFalse(sn.notificar_mac("t", "x", correr=rebenta))
+        self.assertIn("Notificacao falhou", self.captura.texto())
+
+    def test_chave_notificar_no_config(self):
+        self.assertTrue(self.cfg.p.notificar)
+        self.assertFalse(self.config("notificar = nao\n", "n.ini").p.notificar)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

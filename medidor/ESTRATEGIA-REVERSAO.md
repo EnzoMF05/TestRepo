@@ -17,7 +17,7 @@ Este documento é a especificação que `reversao.py` (fórmulas puras), `sinali
 - **As baleias confirmam e dimensionam; nunca disparam nem dirigem.** Oito medidas de fluxo e de posicionamento, cada uma com limiar congelado antes de medir, somam uma pontuação que só altera o factor de tamanho. Tudo fica na nota para o relatório cruzar com os resultados do medidor. Sem a chave da CoinGlass, cada termo que dela depende vale zero e o campo vale `na`.
 - **Tamanho:** Kelly fraccionário nas unidades certas, risco por trade, volatilidade alvo e liquidez, o mínimo dos quatro, com tecto absoluto; em fase de calibração (menos de 30 trades virtuais fechados) escreve-se sempre `tamanho_base`, para o medidor acumular os 100 sinais da sua regra.
 - **Tudo o que depende de velas tem backtest; tudo o que depende de negócios, posições e liquidações só se mede ao vivo**, e o sinalizador grava-o desde o primeiro dia para que, com o tempo, também tenha backtest.
-- **Valores de partida:** `h_A = 96`, `N = 720`, `z_in = 2,0`, `z_out = 0,5`, `z_stop = 3,0`, `z_veto = 4,0`, `n_H = 2`, `H em [3, 24]`, `t_crit` calibrado (cerca de -3,3), `k_kelly = 0,25`, `risco_por_trade = 0,005`, `tamanho_base = 1000`. Tudo em `config.ini`, nunca no código.
+- **Valores de partida:** `h_A = 96`, `N = 720`, `z_in = 2,0`, `z_out = 0,5`, `z_stop = 3,0`, `z_veto = 4,0`, `n_H = 2`, `H em [3, 24]`, `t_crit` calibrado (cerca de -3,0), `k_kelly = 0,25`, `risco_por_trade = 0,005`, `tamanho_base = 1000`. Tudo em `config.ini`, nunca no código.
 
 ---
 
@@ -423,7 +423,7 @@ Rajadas novas, TWAP contra e FUEL durante o trade **não** fecham a posição (s
 
 ### 7.5 Trade virtual e registo próprio
 
-O sinalizador mantém um trade virtual por activo em `dados/registo_sinalizador.csv` (`id, hora, ativo, lado, preco, A_0, sigma_0, phi_0, H_0, G, L, tmax_15, fase, f_B, hora_saida, preco_saida, motivo em {alvo, stop, tempo, invalidacao}, velas, mae_bps, mfe_bps, r_bruto_bps, funding_bps, r_liq_bps, nota`), avançado a cada fecho de 15 m: alvo se o **fecho** passa `P_alvo = exp(A_0 + lado z_out sigma_0)`; stop se a mínima/máxima (ou o mark) toca `P_stop`, preenchido ao nível do stop com deslize de `imp_bps`; se alvo e stop na mesma vela, conta o stop. As saídas nunca vão para `sinais.csv`: o medidor contá-las-ia como entradas do lado contrário.
+O sinalizador mantém um trade virtual por activo em `dados/registo_sinalizador.csv` (`id, hora, ativo, lado, preco, A_0, sigma_0, phi_0, H_0, G, L, tmax_15, fase, f_B, hora_saida, preco_saida, motivo em {alvo, stop, tempo, invalidacao}, velas, mae_bps, mfe_bps, r_bruto_bps, funding_bps, r_liq_bps, nota`), avançado a cada fecho de 15 m: alvo se o **fecho** passa `P_alvo = exp(A_0 - lado z_out sigma_0)`; stop se a mínima/máxima (ou o mark) toca `P_stop`, preenchido ao nível do stop com deslize de `imp_bps`; se alvo e stop na mesma vela, conta o stop. As saídas nunca vão para `sinais.csv`: o medidor contá-las-ia como entradas do lado contrário.
 
 ### 7.6 Disjuntores (param a emissão; nunca fecham posições; o trade virtual continua)
 
@@ -587,7 +587,7 @@ Activos que falham ficam desligados em `config.ini` e só se religam com nova va
 | --- | --- | --- |
 | `h_a` | 96 | Meia-vida da âncora em velas de 1 h; `>= 4 H_max` para `rho >= 0,75` |
 | `n_ajuste`, `n_min`, `n_max` | 720, 480, 2160 | Janela do AR(1); 720 dá IC de `theta` com largura cerca de 35 % (medido); cresce com o histórico |
-| `calibrar_nula`, `alpha_nula`, `replicas_nula`, `semente_nula` | sim, 0.001, 1000, 7 | Limiar `t_crit` por simulação da nula (11); medido -3,3 a -3,4 em N = 720 |
+| `calibrar_nula`, `alpha_nula`, `replicas_nula`, `semente_nula` | sim, 0.001, 1000, 7 | Limiar `t_crit` por simulação da nula (11); cerca de -3,0 com 1000 réplicas em N = 720 (ver secção 16) |
 | `t_nulo_max` | -3.0 | Fallback de `t_crit`; -3 é o limiar de factores novos de Harvey, Liu e Zhu |
 | `t_amarelo` | -2.0 | Fronteira do AMARELO (regista-se, não se sinaliza) |
 | `q_vr`, `vr_max_verde`, `vr_veto`, `zvr_veto` | 8, 1.0, 1.2, 2.0 | Rácio de variâncias: uma meia-vida típica; veto de tendência clara |
@@ -640,7 +640,7 @@ A API completa, assinatura a assinatura, está na lista `api` que acompanha este
 ## 14. Testes (resumo; a lista completa acompanha o documento)
 
 - AR(1) sobre passeio aleatório devolve `phi_c` perto de `lambda_A`, `t_nulo` com média perto de 0 e `rho = 0`; sobre OU com `H` conhecido recupera `H` dentro do intervalo e `t_nulo <= t_crit`.
-- `calibrar_t_crit` é determinista (mesma semente, mesmo valor bit a bit) e dá cerca de -3,3 para `N = 720`.
+- `calibrar_t_crit` é determinista (mesma semente, mesmo valor bit a bit) e dá cerca de -3,0 para `N = 720`.
 - `z*(q)` coincide com `z_simples(q)` em dados homoscedásticos.
 - `S(z)` e `P_teo` dão 0,899 para (1,9; 0,5; 3).
 - O gatilho exige FORA anterior, não dispara duas vezes na mesma excursão, não dispara do lado oposto.
@@ -669,3 +669,23 @@ A API completa, assinatura a assinatura, está na lista `api` que acompanha este
 12. A âncora exponencial é uma decisão de modelo; outra âncora daria outro universo de parâmetros e cada escolha conta como ensaio.
 13. O sinalizador não gere a posição real: as saídas são virtuais; quem opera executa-as à mão (a Etapa 4 não existe) e a diferença entre a saída virtual ao fecho e a real é um custo não medido.
 14. Três perps correlacionados com BTC: três sinais na mesma hora são quase um só trade; `expo_max` limita, mas o `n` efectivo é menor do que o contado.
+
+---
+
+## 16. Desvios da implementação face a esta especificação
+
+A implementação foi revista por três revisores adversariais e corrigida; onde a especificação estava errada, omissa ou contraditória, o código segue a leitura abaixo e assinala-a com um comentário `NOTA ESPEC`. Em caso de dúvida manda o código.
+
+1. **Limiar `t_crit`.** A especificação dizia "cerca de -3,3", que era o mínimo de 600 réplicas e por isso ruidoso. Com 20 000 réplicas da mesma nula o quantil 0,001 é -2,95; com as 1000 réplicas e a semente 7 do `config.ini` sai -3,02, com o quantil interpolado (tipo 7). Os valores de partida e o plano de testes passaram a "cerca de -3,0".
+2. **Alvo do trade virtual (7.5).** `P_alvo = exp(A_0 - lado z_out sigma_0)`: a banda `z_out` do **mesmo** lado da entrada, como exigem (58), (62) e G3. A versão com sinal positivo punha o alvo do lado oposto da âncora, a 2,4 sigma da entrada. Corrigido acima no texto e no código.
+3. **Combustível (51).** Contam as posições com o sinal do próprio lado (longs numa compra) cujo `liquidationPx` fica a menos de `pct_fuel` do preço na direcção do stop: são essas que alimentam a cascata contra a entrada. A frase "do lado contrário" era fisicamente impossível (um short nunca liquida na direcção do stop de uma compra).
+4. **Convenção `T` das velas.** Na Hyperliquid `T = t + intervalo - 1 ms` (fim inclusivo). O funding por hora, o arrefecimento e a sessão da nota usam `t + intervalo`, nunca `T % 1 h`.
+5. **Janela `N` do ajuste.** `N = min(n_max, velas de 1 h fechadas depois do aquecimento da âncora)`, validada por `n_min`, igual ao vivo e no backtest; `n_ajuste` é a janela de referência (entra na variante e na sigma do nulo GBM) e não altera `N`. A âncora aquece `ceil(4 h_A)` velas antes de os desvios entrarem no ajuste.
+6. **Colunas enriquecidas.** `raj` é o lado da última rajada, `twap` o resultado para `lado = +1` e `abs` o resíduo sem lado: convenção absoluta, igual no escritor (sinalizador) e no leitor (backtest, variante B).
+7. **Fluxo causal.** As janelas de fluxo, liquidações e contexto excluem tudo o que é posterior ao fecho avaliado (`JanelaSomaCausal`, `ctx_em(T)`), e os negócios são deduplicados por `tid` ao religar.
+8. **Relógio e cortes.** Sem ligação o relógio não declara fechos; as velas em falta são recuperadas por `candleSnapshot` e fechadas 1 h antes de 15 m sem avaliação, marcadas com `corte = 1`.
+9. **`hash_variante`.** Serializa `nome=valor` ordenado por nome com 6 casas, em vez de JSON, que não está nos imports do núcleo.
+10. **Lista de baleias.** `liquidados_7d` vem só das rajadas próprias detectadas (47); o `whale-alert` da CoinGlass não é pedido. O leaderboard não expõe subcontas, por isso cada endereço conta por si. Se o esquema do leaderboard mudar, a lista em memória continua a ser sondada; o ficheiro `baleias.csv` só tem prefixos e hashes.
+11. **Disjuntores (63).** `perdas_dia` e `cvar` somam os trades fechados de todos os activos e são globais (até à meia-noite UTC e até `reset`); `seguidas` e `regime` são por activo.
+12. **Caudas pesadas no backtest.** Quando (31) leva `z_in_ef` para cima de `z_stop`, não há reentrada nesse fecho (a especificação era omissa).
+13. **Notificação no macOS.** Não estava na especificação: com `notificar = sim`, o sinalizador mostra uma notificação com som quando escreve um sinal e quando o trade virtual fecha, com o comando do bilhete. Noutros sistemas não faz nada.

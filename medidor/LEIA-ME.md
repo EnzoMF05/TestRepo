@@ -140,7 +140,7 @@ Tudo fica neste computador. O medidor não envia os seus registos para lado nenh
 
 ## 10. O que foi testado e o que falta confirmar
 
-Testado: 106 testes das fórmulas e das peças (62 do núcleo, 44 do medidor), mais uma simulação com 91 conferências contra uma bolsa simulada que fala o formato documentado da Hyperliquid. Inclui queda de ligação, paragem de dados sem queda, fills parciais, sinais atrasados, paragem a meio, o bilhete com estado velho e a regra com e sem margem. Corre em Python 3.9 e 3.13; a versão 2.5 foi conferida em 3.13 com websockets 17.
+Testado: 277 testes das fórmulas e das peças (62 do núcleo, 44 do medidor, 87 do núcleo de reversão, 61 do sinalizador, 23 do backtest), mais duas simulações contra bolsas simuladas que falam o formato documentado da Hyperliquid: a do medidor, com 91 conferências, e a do sinalizador, com 89, em tempo acelerado, com velas, histórico, funding, posições, leaderboard e CoinGlass falsos. Incluem queda de ligação, paragem de dados sem queda, fills parciais, sinais atrasados, paragem a meio, rearranque, o bilhete com estado velho e a regra com e sem margem. Corre em Python 3.9 e 3.13; a versão 2.5 e o sinalizador foram conferidos em 3.13 com websockets 17 e compilados em 3.11.
 
 Por confirmar na sua máquina:
 
@@ -152,10 +152,67 @@ Por confirmar na sua máquina:
 
 - `nucleo.py` tem as fórmulas, sem rede nem ficheiros. É a referência para as Etapas 3 a 5.
 - `medidor.py` trata das ligações, dos registos, do painel e do relatório.
+- `reversao.py` tem as fórmulas da estratégia de reversão (Etapa 1), puras como o `nucleo.py`; `sinalizador.py` é o processo ao vivo que escreve os sinais; `backtest_reversao.py` corre a mesma regra sobre velas guardadas. A especificação está em `ESTRATEGIA-REVERSAO.md`.
 - Depois de qualquer alteração, com o ambiente activo (`source .venv/bin/activate`):
 
 ```
 python3 testes/teste_nucleo.py
 python3 testes/teste_medidor.py
+python3 testes/teste_reversao.py
+python3 testes/teste_sinalizador.py
+python3 testes/teste_backtest.py
 python3 testes/simulacao.py
+python3 testes/simulacao_sinalizador.py
 ```
+
+## 12. Sinalizador de reversão (Etapa 1)
+
+O sinalizador gera os sinais que o medidor mede. Lê o gráfico de 1 hora, decide no fecho de cada vela de 15 minutos e escreve a linha em `dados/sinais.csv`. Não envia ordens. A estratégia e a matemática estão em `ESTRATEGIA-REVERSAO.md`; os parâmetros estão na secção `[sinalizador]` do `config.ini`, com o significado de cada um.
+
+### Pôr a correr
+
+1. `bash arrancar.sh sinalizador verificar` confere as oito hipóteses sobre a API da Hyperliquid (formato das velas, ordem dos endereços nos negócios, unidade do open interest, funding, hash dos TWAP, leaderboard, CoinGlass, atraso). Uma linha `FALHA` corrige-se antes de continuar; `AVISO` é informação.
+2. `bash arrancar.sh sinalizador historico` descarrega as velas de 1 hora e de 15 minutos e o funding para `dados/velas/` e `dados/funding/`. A Hyperliquid dá até 5000 velas por intervalo: cerca de 208 dias de 1 hora e 52 de 15 minutos. Repita de vez em quando para a amostra crescer.
+3. Numa janela do Terminal, `bash arrancar.sh` (o medidor). Noutra, `bash arrancar.sh sinalizador` (o sinalizador). Partilham a pasta `dados`: só o sinalizador escreve em `sinais.csv` e só o medidor nos seus registos.
+
+O sinalizador precisa de pelo menos 480 velas de 1 hora fechadas, que o histórico já traz, e calibra o limiar do teste no arranque. O medidor tem os seus 30 minutos de aquecimento. Haverá dias sem nenhum sinal: a estratégia só entra quando a estatística diz que há reversão, e em tendência clara cala-se.
+
+### Quando aparece um sinal
+
+O sinalizador escreve a linha, regista-a no log e, no macOS, mostra uma notificação com som e com o comando do bilhete. Quem opera:
+
+1. Corre `python3 medidor.py bilhete ATIVO LADO TAMANHO` e lê a rota, o tipo (IOC ou ALO), o preço e o tamanho em unidades.
+2. Coloca a ordem na Hyperliquid à mão. Um ou dois minutos de atraso custam pouco face a um alvo de mais de 100 bps; o medidor mede esse custo na coluna D.
+3. Coloca de imediato o stop e o alvo na bolsa. Os dois preços estão em `dados/estado_sinalizador.json`, no trade aberto do activo (`p_stop` e `p_alvo`), e o stop também na nota do sinal (`pst=`).
+4. Quando o trade virtual fecha, por alvo, stop, tempo ou invalidação, o sinalizador escreve a linha em `dados/registo_sinalizador.csv`, regista no log e volta a notificar. Fecha-se a posição à mão se ainda estiver aberta.
+
+Nos primeiros 30 trades virtuais fechados de cada activo (fase `cal`) o tamanho é sempre `tamanho_base`, 1000 usd, para o medidor acumular sinais comparáveis. Depois (fase `op`) o tamanho sai do menor de quatro tectos: Kelly fraccionário, risco por trade, volatilidade alvo e liquidez, sobre `capital_usd`. Se a taxa de acerto medida não paga os custos, o activo passa a `sombra`: continua a registar trades virtuais mas não escreve sinais.
+
+### Ficheiros próprios do sinalizador
+
+| Ficheiro | Conteúdo |
+| --- | --- |
+| `dados/velas/ATIVO_15m_DIA.csv`, `dados/velas/ATIVO_1h_DIA.csv` | Velas, e no 15 m as colunas de fluxo, negócios grandes, rajadas, TWAP, open interest, funding, liquidações e posições |
+| `dados/funding/ATIVO.csv` | Funding por hora |
+| `dados/registo_sinalizador.csv` | Um trade virtual por linha: entrada, alvo, stop, tempo, saída, resultado bruto, funding e líquido, nota |
+| `dados/estado_sinalizador.json` | Estado de cada activo e trade aberto, reescrito de forma atómica |
+| `dados/baleias.csv` | Lista diária de grandes contas, só prefixos e hashes dos endereços |
+| `dados/ensaios.csv` | Todas as configurações experimentadas, para o controlo de sobre-ajuste |
+| `dados/sinalizador.log` | Avisos e erros, com rotação |
+
+Outros comandos: `relatorio` cruza o registo próprio com o do medidor e agrupa pela nota; `baleias` refaz a lista; `ensaios` lista as configurações; `reset` levanta os disjuntores.
+
+### CoinGlass
+
+Opcional. A única linha a preencher é `chave` na secção `[coinglass]` do `config.ini`; a chave nunca aparece em registos, notas nem no log. Com ela, o sinalizador ganha as liquidações por lado em tempo real (o termo "cascata esgotada") e, para a lista de baleias, as posições acima de 1 milhão de dólares na Hyperliquid. Sem ela, esses termos valem zero e a nota diz `na`.
+
+### Backtest
+
+```
+python3 backtest_reversao.py --ativo BTC                    só velas e funding (variante A)
+python3 backtest_reversao.py --ativo BTC --walk             walk-forward, IS 90 dias e OOS 30
+python3 backtest_reversao.py --ativo BTC --nulo --placebo   passeio aleatório sem portão e âncora deslocada
+python3 backtest_reversao.py --ativo BTC --degradada-1h     gatilho nos fechos de 1 hora, para os 208 dias
+```
+
+Com 52 dias de velas de 15 minutos não há uma janela completa de walk-forward: até o histórico chegar a 120 dias, o backtest de 15 minutos é um ensaio de sanidade, e a validação séria é a variante de 1 hora e, ao vivo, os 100 sinais medidos pelo medidor. Os critérios de aceitação estão na secção 11.7 da especificação.

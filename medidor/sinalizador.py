@@ -44,6 +44,8 @@ import logging
 import logging.handlers
 import math
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -193,6 +195,7 @@ class ParametrosSinalizador:
     c_l_bps: float = 13.0
     arrefecimento_velas: int = 2
     lado_por_tick: bool = False        # H2 falhada em verificar: lado do negocio pelo tick
+    notificar: bool = True             # notificacao do macOS (osascript) quando um sinal e escrito
     veto_sessao: Tuple[str, ...] = ()
     enderecos_excluidos: Tuple[str, ...] = ()
     pasta_velas: str = "dados/velas"
@@ -256,6 +259,7 @@ class ConfigSinalizador(Config):
             g_min_x_custo=f("g_min_x_custo", 3.0), custo_taxa_entrada_bps=f("custo_taxa_entrada_bps", 4.5),
             imp_defeito_bps=f("imp_defeito_bps", 2.0), c_w_bps=f("c_w_bps", 8.0), c_l_bps=f("c_l_bps", 13.0),
             arrefecimento_velas=i("arrefecimento_velas", 2), lado_por_tick=_sim(g("lado_por_tick", "nao")),
+            notificar=_sim(g("notificar", "sim")),
             veto_sessao=sessoes, enderecos_excluidos=excluidos,
             pasta_velas=pasta_velas, url_leaderboard=g("url_leaderboard", ParametrosSinalizador.url_leaderboard))
         self.p_ctx = rv.ParametrosContexto(
@@ -621,6 +625,30 @@ def escrever_sinal(cfg: Config, sinal: rv.Sinal) -> int:
              "compra" if sinal.lado > 0 else "venda", sinal.ativo, sinal.preco, sinal.alvo_bps, sinal.tamanho_usd,
              t - sinal.hora_ms)
     return t
+
+
+def notificar_mac(titulo: str, texto: str, correr: Callable[..., Any] = subprocess.run) -> bool:
+    """Notificacao no macOS por osascript (display notification); noutros sistemas nao faz nada.
+
+    Nunca levanta: devolve True se o comando correu, False se nao ha osascript ou se falhou.
+    Texto e titulo perdem aspas, barras e caracteres de controlo, porque entram numa string
+    do AppleScript, e ficam limitados a 200 caracteres. Quem opera a mao recebe assim o
+    sinal sem ter de olhar para o terminal; a ordem continua a ser dela.
+    """
+    if shutil.which("osascript") is None:
+        return False
+
+    def limpo(s: Any) -> str:
+        return "".join(ch for ch in str(s) if ch not in '"\\' and ord(ch) >= 32)[:200]
+
+    guiao = 'display notification "%s" with title "%s" sound name "Glass"' % (limpo(texto), limpo(titulo))
+    try:
+        correr(["osascript", "-e", guiao], timeout=5, check=False,
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception as e:  # a notificacao nunca pode parar o ciclo
+        log.warning("Notificacao falhou (%s)", e)
+        return False
 
 
 _AVISO_MEDIDOR = {"ms": 0}
@@ -1950,10 +1978,19 @@ class Sinalizador:
         linha = self._passo("trade virtual " + nome, at.avancar_trade_virtual, vela)
         if linha:
             self._passo("disjuntores", self._aplicar_disjuntores, agora)
+            if self.cfg.p.notificar:  # quem executa a mao tem de saber que o trade virtual fechou
+                self._passo("notificacao", notificar_mac, "Saida virtual: %s %s" % (nome, linha.get("motivo", "")),
+                            "preco %s, resultado liquido %s bps. Feche a posicao a mao se ainda a tiver."
+                            % (linha.get("preco_saida", "?"), linha.get("r_liq_bps", "?")))
         res = self._passo("fecho 15m " + nome, at.fecho_15m, vela, agora, avaliar)
         sinal, motivo = res if res else (None, "erro")
         if sinal is not None:
-            self._passo("escrita " + nome, escrever_sinal, self.cfg, sinal)
+            t_escrita = self._passo("escrita " + nome, escrever_sinal, self.cfg, sinal)
+            if t_escrita and self.cfg.p.notificar:
+                lado_txt = "compra" if sinal.lado > 0 else "venda"
+                self._passo("notificacao", notificar_mac, "Sinal de reversao: %s %s" % (lado_txt, nome),
+                            "preco %.8g, alvo %.1f bps, %.0f usd. Bilhete: python3 medidor.py bilhete %s %s %.0f"
+                            % (sinal.preco, sinal.alvo_bps, sinal.tamanho_usd, nome, lado_txt, sinal.tamanho_usd))
         self._passo("guardar 15m " + nome, hist.guardar, vela, at.ultima)
         log.info("%s fecho 15m %s: c %.6g z %.2f %s %s %s%s", nome, iso_utc(vela.T), vela.c,
                  at.exc.z if at.exc.z == at.exc.z else NAN, at.exc.estado, motivo, at.ultimo_detalhe,

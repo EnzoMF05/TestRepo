@@ -4,6 +4,7 @@
 #   bash arrancar.sh               corre o medidor (Ctrl+C para parar)
 #   bash arrancar.sh relatorio     mostra o resumo do que foi medido
 #   bash arrancar.sh sinal BTC compra
+#   bash arrancar.sh sinalizador verificar   (ou historico, correr, baleias, relatorio, ensaios, reset)
 cd "$(dirname "$0")" || exit 1
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Nao encontrei o python3. Instale o Python em https://www.python.org/downloads/ e repita."
@@ -21,5 +22,12 @@ if ! python3 -c "import websockets" >/dev/null 2>&1; then
 fi
 if [ $# -eq 0 ] && command -v caffeinate >/dev/null 2>&1; then
   exec caffeinate -i python3 medidor.py   # impede o Mac de adormecer enquanto mede
+fi
+if [ "$1" = "sinalizador" ]; then
+  shift
+  if [ $# -eq 0 ] && command -v caffeinate >/dev/null 2>&1; then
+    exec caffeinate -i python3 sinalizador.py   # tal como o medidor, sem deixar o Mac adormecer
+  fi
+  exec python3 sinalizador.py "$@"
 fi
 exec python3 medidor.py "$@"
