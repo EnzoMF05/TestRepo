@@ -1223,7 +1223,7 @@ class NuloGBM(unittest.TestCase):
                     lado = lado_g
                     p_ent = vela.c
                     _, tmax_15 = rv.tempo_maximo(meia_vida, 2.0, 16.0)
-                    p_alvo = math.exp(a_ult + lado * 0.5 * sigma_eq)
+                    p_alvo = rv.preco_alvo(a_ult, sigma_eq, lado, 0.5)        # banda z_out do mesmo lado
                     p_stop = rv.preco_stop(a_ult, sigma_eq, lado, self.Z_STOP)
                     tv = rv.TradeVirtual(lado, p_ent, p_alvo, p_stop, tmax_15, 0.0)
             z_prev = z_k
@@ -1262,6 +1262,103 @@ class NuloGBM(unittest.TestCase):
         b = self._correr(5, 2026)
         self.assertEqual(a, b)
         self.assertGreater(len(a), 0)
+
+
+# ==========================================================================
+# Correccoes da revisao (um teste por achado corrigido em reversao.py)
+# ==========================================================================
+class Correccoes(unittest.TestCase):
+    def test_preco_alvo_fica_do_mesmo_lado_da_entrada_que_o_stop(self):
+        # (58)(59)(62): numa compra com z_0 = -1,9 o alvo e a banda z = -0,5 (1,4 sigma acima da entrada),
+        # nunca z = +0,5 (2,4 sigma); G de (58) e exactamente a distancia da entrada ao alvo
+        a0, sig = math.log(100.0), 0.01
+        for lado in (1, -1):
+            p_alvo = rv.preco_alvo(a0, sig, lado, 0.5)
+            p_stop = rv.preco_stop(a0, sig, lado, 3.0)
+            p_ent = math.exp(a0 - lado * 1.9 * sig)
+            self.assertAlmostEqual(p_alvo, math.exp(a0 - lado * 0.5 * sig), places=12)
+            self.assertGreater(lado * (p_alvo - p_ent), 0.0)                         # a favor
+            self.assertGreater(lado * (p_ent - p_stop), 0.0)                         # stop do outro lado
+            self.assertLess(lado * (p_alvo - math.exp(a0)), 0.0)                      # aquem da ancora
+            d0 = -lado * 1.9 * sig
+            g = rv.alvo_bps(d0, sig, 2.0 ** (-1.0 / 4.0), LAM_96, 16.0, 0.5)          # H = 4: a esperanca passa a banda e manda |d_0| - z_out sigma
+            self.assertAlmostEqual(g, nu.BPS * abs(math.log(p_alvo / p_ent)), places=6)
+            tv = rv.TradeVirtual(lado, p_ent, p_alvo, p_stop, 8, 0.0)                 # geometria aceite
+            self.assertEqual(tv.p_alvo, p_alvo)
+        with self.assertRaises(ValueError):
+            rv.preco_alvo(a0, 0.0, 1, 0.5)
+        with self.assertRaises(ValueError):
+            rv.preco_alvo(a0, sig, 0, 0.5)
+
+    def test_twap_com_varios_negocios_no_mesmo_instante(self):
+        # uma fatia que cruza varios niveis do livro da varios negocios com o mesmo time: conta como uma
+        cfg = _params(rv.ParametrosTwap)
+        ng = rv.NegociosGrandes(1000, 0.99, 86_400_000)
+        for i in range(4):
+            for _ in range(3):
+                ng.negocio(100_000 + 30_000 * i, -1, 50.0, "h_twap", "h_x", 100.0, True)
+        self.assertEqual(ng.twap(200_000, 1, cfg)[0], -1)
+        self.assertEqual(ng.twap(200_000, -1, cfg)[0], 1)
+        ng2 = rv.NegociosGrandes(1000, 0.99, 86_400_000)
+        for _ in range(3):                                                           # 3 negocios num so instante: 1 fatia
+            ng2.negocio(100_000, -1, 50.0, "h_twap", "h_x", 100.0, True)
+        self.assertEqual(ng2.twap(200_000, 1, cfg)[0], 0)
+
+    def test_pbo_com_empates_conta_o_rank_medio(self):
+        # matriz em que nada distingue as configuracoes: w = 0,5, lambda = 0, sobre-ajuste em todas as combinacoes
+        self.assertEqual(rv.pbo_cscv([[0.0] * 5 for _ in range(32)], 16), 1.0)
+        self.assertEqual(rv.pbo_cscv([[0.0] for _ in range(32)], 16), 1.0)
+        self.assertEqual(rv.pbo_cscv([[1.0, 1.0, 1.0] for _ in range(32)], 16), 1.0)
+        g = random.Random(5)
+        m = [[g.gauss(0.0, 1.0) for _ in range(6)] for _ in range(64)]              # sem empates: como antes
+        self.assertTrue(0.0 <= rv.pbo_cscv(m, 16) <= 1.0)
+        self.assertLess(rv.pbo_cscv([[linha[0] + 3.0] + linha[1:] for linha in m], 16), 0.1)
+
+    def test_soma_causal_exclui_o_que_chegou_depois_do_instante(self):
+        js = rv.JanelaSomaCausal(900_000)
+        js.juntar(1_000, 5.0)
+        js.juntar(2_000, 7.0)
+        js.juntar(2_900, 12.0)                                                       # 900 ms depois de T = 2000
+        self.assertEqual(js.soma(2_000), 12.0)
+        self.assertEqual(js.soma(2_900), 24.0)
+        self.assertEqual(js.soma(1_000 + 900_000), 19.0)                             # o de t = 1000 expirou
+        fa = rv.FluxoAgressor(900_000)
+        fa.negocio(1_000, 1, 5.0)
+        fa.negocio(1_500, -1, 2.0)
+        fa.negocio(2_500, 1, 7.0)
+        self.assertEqual((fa.v_b(2_000), fa.v_a(2_000)), (5.0, 2.0))
+        self.assertAlmostEqual(fa.ofi(2_000), 3.0 / 7.0)
+        self.assertEqual(fa.v_b(2_500), 12.0)
+
+    def test_rajadas_com_lado_e_hash_do_agressor(self):
+        ng = rv.NegociosGrandes(1000, 0.99, 86_400_000)
+        for i in range(100):
+            ng.negocio(1_000 + i, 1, 100.0, "h%d" % i, "p", 100.0, False)            # Q99 = 100
+        for t_ms, px in ((10_000, 100.00), (10_400, 99.98), (10_900, 99.97)):       # vendas: bloco de 1200, -3 bps
+            ng.negocio(t_ms, -1, 400.0, "h_liq", "h_x", px, True)
+        for t_ms, px in ((30_000, 100.00), (30_300, 100.02), (30_800, 100.04)):     # compras: bloco de 1500, +4 bps
+            ng.negocio(t_ms, 1, 500.0, "h_liq2", "h_y", px, True)
+        raj = ng.rajadas(31_000, 60.0, 1000, 2.0)
+        self.assertEqual(raj, [(10_900, -1, "h_liq"), (30_800, 1, "h_liq2")])
+        self.assertEqual(ng.lado_rajada(31_000, 60.0, 1000, 2.0), 1)                 # a ultima
+        self.assertEqual(ng.lado_rajada(20_000, 60.0, 1000, 2.0), -1)
+        self.assertEqual(ng.lado_rajada(30_800 + 61_000, 60.0, 1000, 2.0), 0)        # silencio passou para as duas
+        self.assertTrue(ng.rajada_contra(31_000, 1, 60.0, 1000, 2.0))                # ha vendas contra uma compra
+        self.assertTrue(ng.rajada_contra(31_000, -1, 60.0, 1000, 2.0))               # e compras contra uma venda
+        self.assertEqual(ng.n_grandes(10_000, 10_900), 3)
+        self.assertEqual(ng.n_grandes(10_000, 10_500), 2)                            # os posteriores a T nao contam
+
+    def test_regras_partilhadas_de_t_crit_e_do_quantil(self):
+        self.assertEqual(rv.n_calibracao(479, 480, 2160), 0)                        # sem ajuste valido: t_nulo_max
+        self.assertEqual(rv.n_calibracao(480, 480, 2160), 480)
+        self.assertEqual(rv.n_calibracao(719, 480, 2160), 480)
+        self.assertEqual(rv.n_calibracao(720, 480, 2160), 720)
+        self.assertEqual(rv.n_calibracao(2500, 480, 2160), 2160)
+        self.assertEqual(rv.n_calibracao(500, 480, 2160, 24), 480)
+        self.assertEqual(rv.n_calibracao(504, 480, 2160, 24), 504)
+        self.assertEqual(rv.n_min_quantil_z(720, 480), 480)
+        self.assertEqual(rv.n_min_quantil_z(96, 480), 96)
+        self.assertEqual(rv.PASSO_T_CRIT, 240)
 
 
 if __name__ == "__main__":

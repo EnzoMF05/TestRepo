@@ -35,7 +35,7 @@ import random
 import statistics
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 import medidor as md
 import nucleo as nu
@@ -60,7 +60,7 @@ GRELHA_DECLARADA: Dict[str, Tuple[float, ...]] = {
 }
 MOTIVOS_SAIDA = ("alvo", "stop", "tempo", "invalidacao")
 ROTAS = ("agressiva", "passiva")
-PASSO_T_CRIT = 240          # t_crit calibrado por patamares de N (velas de 1 h)
+PASSO_T_CRIT = rv.PASSO_T_CRIT   # t_crit calibrado por patamares de N (velas de 1 h), a mesma regra do sinalizador
 HORAS_NULO = 480            # horas de negociacao por caminho do nulo GBM, depois do aquecimento
 SUB_PASSOS = 4              # passos do passeio por vela sintetica (o stop toca entre fechos)
 N_CAMINHOS_P_NULO = 10_000  # seccao 11.6
@@ -427,14 +427,14 @@ def agregar_1h_de_15m(velas_15m: Sequence[Vela]) -> List[Vela]:
 
 def velas_de_trajectoria(x: Sequence[float], sub: int, t0_ms: int, dt_ms: int = MS_15M,
                          preco_base: float = 100.0) -> List[Vela]:
-    """Velas a partir de um caminho de log-preco com `sub` passos por vela: o = primeiro ponto, c = ultimo, h e l = extremos do troco."""
+    """Velas a partir de um caminho de log-preco com `sub` passos por vela: o = primeiro ponto, c = ultimo, h e l = extremos do troco; T = t + dt - 1 como na Hyperliquid."""
     if sub < 1 or preco_base <= 0.0 or dt_ms <= 0:
         raise ValueError("sub >= 1, preco_base > 0 e dt_ms > 0")
     n = (len(x) - 1) // sub
     velas: List[Vela] = []
     for j in range(n):
         troco = x[j * sub: (j + 1) * sub + 1]
-        velas.append(Vela(t0_ms + j * dt_ms, t0_ms + (j + 1) * dt_ms, preco_base * math.exp(troco[0]),
+        velas.append(Vela(t0_ms + j * dt_ms, t0_ms + (j + 1) * dt_ms - 1, preco_base * math.exp(troco[0]),
                           preco_base * math.exp(max(troco)), preco_base * math.exp(min(troco)),
                           preco_base * math.exp(troco[-1]), 1.0, sub, True))
     return velas
@@ -467,10 +467,10 @@ class Contexto1h:
 
 
 def _t_crit(p: Params, lam_a: float, n: int, cache: Dict[int, float]) -> float:
-    """(11) t_crit calibrado para N por patamares de PASSO_T_CRIT velas; t_nulo_max com a calibracao desligada ou N < n_min."""
-    if not p.calibrar_nula or n < p.n_min:
+    """(11) t_crit calibrado para rv.n_calibracao(N) (patamares de PASSO_T_CRIT velas); t_nulo_max com a calibracao desligada ou N < n_min."""
+    n_cal = rv.n_calibracao(n, p.n_min, p.n_max)
+    if not p.calibrar_nula or n_cal == 0:
         return p.t_nulo_max
-    n_cal = min(p.n_max, max(p.n_min, n - n % PASSO_T_CRIT))
     if n_cal not in cache:
         cache[n_cal] = rv.calibrar_t_crit(n_cal, lam_a, p.replicas_nula, p.alpha_nula, p.semente_nula)
     return cache[n_cal]
@@ -479,16 +479,20 @@ def _t_crit(p: Params, lam_a: float, n: int, cache: Dict[int, float]) -> float:
 def contexto_1h(params: Params, velas_1h: Sequence[Vela], velas_15m: Sequence[Vela] = (),
                 funding: Optional[Dict[int, float]] = None, degradada_1h: bool = False,
                 desloc_ancora: int = 0) -> List[Contexto1h]:
-    """Contexto de 1 h (seccao 4) vela a vela: ancora, AR(1) sobre N = min(velas, n_max), VR, veto diario, estado (35), z_t e q_z.
+    """Contexto de 1 h (seccao 4) vela a vela: ancora, AR(1) sobre N = min(velas depois do aquecimento, n_max), VR, veto diario, estado (35), z_t e q_z.
 
-    N cresce com o historico ate n_max e o ajuste so e valido com N >= n_min (4.3). vol_razao_15 e o
-    estimador de Parkinson com as velas de 15 m fechadas antes do instante do fecho de 1 h (a quarta
-    vela da hora ainda nao entrou, como no processo ao vivo); na variante degradada usa as velas de
-    1 h anteriores. q_z (30) usa os |z| dos fechos de 1 h anteriores, nunca o corrente, e so com
-    min(n_z, n_min) valores. sigma_eq, phi e H ficam em vigor ate ao proximo ajuste valido; a
-    ancora e sempre a corrente. Com desloc_ancora = u > 0 a ancora usada em z e nos niveis e
-    A_{t-u} (placebo da seccao 11.6); o ajuste fica sobre o desvio verdadeiro. t_crit calibra-se
-    por patamares de PASSO_T_CRIT velas de N (o quantil de 1000 replicas muda menos do que isso).
+    Como no sinalizador (ActivoSinal.fecho_1h), o desvio d so entra na janela do AR(1) depois
+    de ceil(4 h_A) velas de aquecimento da ancora (o transitorio da correccao de arranque
+    comprime os primeiros desvios); N cresce depois ate n_max e o ajuste so e valido com
+    N >= n_min (4.3). vol_razao_15 e o estimador de Parkinson com as velas de 15 m fechadas
+    antes do instante do fecho de 1 h (a quarta vela da hora ainda nao entrou, como no processo
+    ao vivo); na variante degradada usa as velas de 1 h anteriores. q_z (30) usa os |z| dos fechos
+    de 1 h anteriores, nunca o corrente, e so com rv.n_min_quantil_z(n_z, n_min) valores.
+    sigma_eq, phi e H ficam em vigor ate ao proximo ajuste valido; a ancora e sempre a corrente.
+    f_hora e a taxa de fundingHistory da hora que esta vela fecha (t + 1 h; T e t + 1 h - 1 ms).
+    Com desloc_ancora = u > 0 a ancora usada em z e nos niveis e A_{t-u} (placebo da seccao
+    11.6); o ajuste fica sobre o desvio verdadeiro. t_crit calibra-se por rv.n_calibracao
+    (patamares de PASSO_T_CRIT velas de N, a regra do sinalizador).
     """
     validar_params(params)
     if desloc_ancora < 0:
@@ -497,6 +501,8 @@ def contexto_1h(params: Params, velas_1h: Sequence[Vela], velas_15m: Sequence[Ve
     cfg_ctx = parametros_contexto(params)
     funding = funding or {}
     anc = rv.Ancora(params.h_a)
+    aquecimento = int(math.ceil(4.0 * params.h_a))            # como ActivoSinal.aquecimento
+    min_z = rv.n_min_quantil_z(params.n_z, params.n_min)
     vol = rv.VolParkinson(params.h_vc, params.h_vl)
     ds: List[float] = []
     xs: List[float] = []
@@ -521,7 +527,8 @@ def contexto_1h(params: Params, velas_1h: Sequence[Vela], velas_15m: Sequence[Ve
             x_abertura = math.log(vela.o)                       # (26) abertura das 00:00 UTC
         d = anc.juntar(ln_c)
         historico_a.append(anc.valor)
-        ds.append(d)
+        if anc.n > aquecimento:
+            ds.append(d)
         if xs:
             rs.append(ln_c - xs[-1])
         xs.append(ln_c)
@@ -540,10 +547,10 @@ def contexto_1h(params: Params, velas_1h: Sequence[Vela], velas_15m: Sequence[Ve
             sigma_ult, phi_ult, h_ult = aj.sigma_eq, aj.phi_c, aj.meia_vida
         a_ult = historico_a[0] if len(historico_a) > desloc_ancora else NAN
         z_t = rv.z_score(ln_c, a_ult, sigma_ult)
-        q_z = rv.quantil_abs_z(list(zs)) if len(zs) >= min(params.n_z, params.n_min) else NAN
+        q_z = rv.quantil_abs_z(list(zs)) if len(zs) >= min_z else NAN
         if z_t == z_t:
             zs.append(abs(z_t))
-        f_hora = funding.get(vela.T, f_hora)
+        f_hora = funding.get(vela.t + MS_1H, f_hora)              # fim da hora pela abertura
         if degradada_1h:
             vol.juntar(vela.h, vela.l)
         saida.append(Contexto1h(vela.T, ctx.estado, ctx.motivos, a_ult, sigma_ult, phi_ult, h_ult, aj.t_nulo,
@@ -566,13 +573,18 @@ def _col(col: Optional[Dict[str, float]], nome: str) -> float:
 class _Baleias:
     """Variante B: termos T1 a T8 e G6 a partir das colunas enriquecidas gravadas ao vivo (seccao 11.1).
 
-    Leitura das colunas, que o sinalizador grava sem conhecer o lado do sinal futuro: flx, rep e
-    abs sao FLX_1h, REP_1h e o residuo (r_k - beta u_k)/s_e sem o factor lado; raj e twap sao o
-    lado s em {-1, 0, +1} da ultima rajada dentro do silencio e do TWAP detectado; oi_usd, funding,
-    liq_long, liq_short, pos e fuel (ja dividido por OI) como na seccao 6. Vazio vale nan e o termo 0.
+    Leitura das colunas, que o sinalizador grava sem conhecer o lado do sinal futuro (a mesma
+    convencao de ActivoSinal.fecho_15m): flx, rep e abs sao FLX_1h, REP_1h e o residuo
+    (r_k - beta u_k)/s_e sem o factor lado; raj e twap sao o lado s em {-1, 0, +1} da ultima rajada
+    dentro do silencio e do TWAP detectado (contra o sinal quando s = -lado); oi_usd, funding,
+    liq_long, liq_short e pos como na seccao 6; fuel (ja dividido por OI) e calculado ao vivo para
+    lado_med = -sign(z_k), que na vela de reentrada e o lado do sinal. Vazio vale nan e o termo 0.
+    dt_ms e a duracao das velas lidas (15 m, ou 1 h na variante degradada): a hora fecha quando
+    t + dt e multiplo de 1 h.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, dt_ms: int = MS_15M) -> None:
+        self.dt_ms = dt_ms
         self.pos_flx = nu.JanelaPercentil(672)       # 7 dias de velas de 15 m
         self.pos_dpos = nu.JanelaPercentil(672)
         self.pos_doi8 = nu.JanelaPercentil(2880)
@@ -621,7 +633,7 @@ class _Baleias:
             self.pos_dpos.juntar(rel)
         f = _col(col, "funding")
         self.z_f = rv.z_robusto(f, list(self.funding_hist)) if f == f else NAN
-        if f == f and vela.T % MS_1H == 0:
+        if f == f and (vela.t + self.dt_ms) % MS_1H == 0:
             self.funding_hist.append(f)
 
     def excursao(self, exc: rv.Excursao, col: Optional[Dict[str, float]]) -> None:
@@ -681,7 +693,8 @@ class _Motor:
         self.vol = rv.VolParkinson(params.h_vc, params.h_vl)
         self.exc = rv.Excursao()
         self.rng = random.Random(semente)
-        self.baleias = _Baleias() if self.colunas is not None else None
+        self.dt_ms = MS_1H if degradada_1h else MS_15M
+        self.baleias = _Baleias(self.dt_ms) if self.colunas is not None else None
         self.trades: List[Trade] = []
         self.motivos_recusa: Dict[str, int] = {}
         self.ctx: Optional[Contexto1h] = None
@@ -714,9 +727,10 @@ class _Motor:
         if self.tv is None or self.pend_inval is not None or self.aberto is None:
             return
         ab = self.aberto
-        # (60) P_alvo = exp(A + lado z_out sigma_0) afasta-se da entrada quando a ancora anda no sentido do
-        # lado: deslocacao contra o trade = lado (A_t - A_0) / sigma_0, positiva quando e contra
-        desloc = ab["lado"] * (ctx.a - ab["a_0"]) / ab["sigma_0"] if ctx.a == ctx.a else NAN
+        # (60) o alvo e a banda z_out do mesmo lado da entrada, P_alvo = exp(A - lado z_out sigma_0): a ancora
+        # a afastar-se do lado em que o trade aposta (a descer numa compra) encurta o destino esperado;
+        # deslocacao contra o trade = -lado (A_t - A_0) / sigma_0, positiva quando e contra (rv.invalidar)
+        desloc = -ab["lado"] * (ctx.a - ab["a_0"]) / ab["sigma_0"] if ctx.a == ctx.a else NAN
         motivo = rv.invalidar(ctx.t_nulo if self.portao else NAN, ctx.vr if self.portao else NAN, ctx.z_vr,
                               ctx.z, desloc, self.cfg_ctx)
         if motivo:
@@ -728,8 +742,9 @@ class _Motor:
         col = self.colunas[k] if self.colunas is not None else None
         if self.tv is not None and self.aberto is not None:                 # 1. o trade virtual avanca
             f_hora = 0.0
-            if vela.T % MS_1H == 0 and self.aberto["t_entrada"] <= vela.T - MS_1H:
-                f_hora = self.funding.get(vela.T, 0.0)                      # hora inteira dentro do trade
+            fim = vela.t + self.dt_ms                                        # fim pela abertura (T e t + dt - 1)
+            if fim % MS_1H == 0 and self.aberto["t_entrada"] < fim:
+                f_hora = self.funding.get(fim, 0.0)                         # marca de hora com a posicao aberta (como ao vivo)
             s = self.tv.avancar(vela, NAN, NAN, f_hora)
             inval = ""
             if s is None and self.pend_inval is not None:                   # (60) sai ao fecho seguinte
@@ -801,7 +816,7 @@ class _Motor:
             "g_bps": rv.alvo_bps(d0, ctx.sigma_eq, ctx.phi, self.lam_a, tau, p.z_out),
             "l_bps": rv.stop_bps(z_k, ctx.sigma_eq, p.z_stop),
             "c_w": c_w, "c_l": c_l,
-            "p_alvo": math.exp(ctx.a + lado * p.z_out * ctx.sigma_eq),
+            "p_alvo": rv.preco_alvo(ctx.a, ctx.sigma_eq, lado, p.z_out),       # banda z_out do mesmo lado
             "p_stop": rv.preco_stop(ctx.a, ctx.sigma_eq, lado, p.z_stop),
             "p_teo": rv.prob_alvo_antes_stop(z_k, p.z_out, p.z_stop),
         }
@@ -911,10 +926,11 @@ def simular(params: Params, velas_1h: List[Vela], velas_15m: List[Vela], funding
             cfg_baleias: Optional[rv.ParametrosBaleias] = None) -> List[Trade]:
     """Motor por eventos (seccoes 4 a 7 e 11.2) com as funcoes de reversao.py e a ordem 1 h antes de 15 m.
 
-    Convencoes conservadoras: entrada ao fecho da vela de reentrada; alvo so se o fecho passa o nivel;
-    stop se a minima ou maxima toca, e alvo e stop na mesma vela contam stop; tempo ao fecho da vela
-    tmax_15; invalidacao (60) detectada no fecho de 1 h e executada ao fecho seguinte; funding por hora
-    inteira dentro do trade com o sinal (64). Rota passiva: preenche ao fecho com probabilidade pi
+    Convencoes conservadoras: entrada ao fecho da vela de reentrada; alvo so se o fecho passa o nivel
+    (preco_alvo, banda z_out do mesmo lado); stop se a minima ou maxima toca, e alvo e stop na mesma vela
+    contam stop; tempo ao fecho da vela tmax_15; invalidacao (60) detectada no fecho de 1 h e executada
+    ao fecho seguinte; funding em cada marca de hora (t + dt multiplo de 1 h) posterior a entrada com a
+    posicao aberta, com o sinal (64), como no sinalizador. Rota passiva: preenche ao fecho com probabilidade pi
     (random.Random(semente)), senao entra a taker na vela seguinte se a condicao se mantiver.
     portao=False (so para o nulo GBM) desliga G1, G8 e a invalidacao por nulo e por VR, e deixa
     o resto da regra. Sem velas_1h, agregam-se das de 15 m. Com degradada_1h o gatilho avalia-se
@@ -1167,8 +1183,42 @@ COLUNAS_ENSAIOS = (["data", "ativo", "variante", "rota", "hash"] + list(CAMPOS_G
                    + ["h_a", "n_ajuste", "n", "expectancia_bps", "ep_bps", "sr", "p_hat", "periodo"])
 
 
-def registar_ensaio(caminho: str, params: Params, met: dict) -> None:
-    """Acrescenta a dados/ensaios.csv (modo a, cabecalho so quando vazio) uma linha por configuracao corrida, descartada ou nao: M do DSR."""
+def chave_ensaio(hash_: str, ativo: str, variante: str, rota: str, periodo: str) -> Tuple[str, str, str, str, str]:
+    """Identidade de um ensaio em ensaios.csv: a mesma configuracao sobre o mesmo activo, variante, rota e periodo conta uma vez."""
+    return (str(hash_ or ""), str(ativo or ""), str(variante or ""), str(rota or ""), str(periodo or ""))
+
+
+def ler_ensaios(caminho: str) -> List[Dict[str, str]]:
+    """Linhas de dados/ensaios.csv (as do backtest e as do sinalizador, que nao tem ativo nem periodo); vazio sem ficheiro."""
+    if not os.path.exists(caminho):
+        return []
+    with open(caminho, "r", encoding="utf-8", newline="") as f:
+        return [dict(ln) for ln in csv.DictReader(f)]
+
+
+def ensaios_unicos(linhas: Sequence[Dict[str, str]], excluir: Optional[Set[Tuple[str, ...]]] = None) -> List[Dict[str, str]]:
+    """Primeira linha de cada chave_ensaio, fora das chaves em `excluir`."""
+    vistas: Set[Tuple[str, ...]] = set(excluir or ())
+    saida: List[Dict[str, str]] = []
+    for ln in linhas:
+        k = chave_ensaio(ln.get("hash", ""), ln.get("ativo", ""), ln.get("variante", ""), ln.get("rota", ""), ln.get("periodo", ""))
+        if k in vistas:
+            continue
+        vistas.add(k)
+        saida.append(ln)
+    return saida
+
+
+def registar_ensaio(caminho: str, params: Params, met: dict) -> bool:
+    """Acrescenta a dados/ensaios.csv (modo a, cabecalho so quando vazio) uma linha por configuracao corrida, descartada ou nao: M do DSR.
+
+    A mesma chave_ensaio (hash, activo, variante, rota, periodo) nao se repete: correr duas vezes o
+    mesmo backtest nao duplica M. Devolve True se escreveu.
+    """
+    chave = chave_ensaio(params.hash(), met.get("ativo", ""), met.get("variante", ""), met.get("rota", ""), met.get("periodo", ""))
+    for ln in ler_ensaios(caminho):
+        if chave_ensaio(ln.get("hash", ""), ln.get("ativo", ""), ln.get("variante", ""), ln.get("rota", ""), ln.get("periodo", "")) == chave:
+            return False
     linha: Dict[str, Any] = {
         "data": md.iso_utc(md.agora_ms()), "ativo": met.get("ativo", ""), "variante": met.get("variante", ""),
         "rota": met.get("rota", ""), "hash": params.hash(), "h_a": md.num(params.h_a, 3), "n_ajuste": params.n_ajuste,
@@ -1178,6 +1228,7 @@ def registar_ensaio(caminho: str, params: Params, met: dict) -> None:
     for c in CAMPOS_GRELHA:
         linha[c] = md.num(float(getattr(params, c)), 4)
     md.Registo(caminho, COLUNAS_ENSAIOS).escrever(linha)
+    return True
 
 
 def ler_sr_ensaios(caminho: str) -> List[float]:
@@ -1306,15 +1357,20 @@ def walk_forward(grelha: List[Params], dados: Dados, cfg: Any) -> dict:
         m = metricas(trades_por_cfg[p], c_w, c_l)
         m.update({"ativo": dados.ativo, "variante": dados.variante, "rota": dados.rota, "periodo": periodo})
         ensaios.append((p, m))
-    sr_lista = [m["sr"] for _, m in ensaios]
+    # M do DSR (11.4): os ensaios desta corrida mais os ja registados em ensaios.csv com outra chave
+    # (os desta corrida, se ja la estiverem de uma corrida anterior, nao contam duas vezes); as linhas
+    # do sinalizador (sem SR) contam para M mas nao para a variancia dos SR
+    chaves_corrida = {chave_ensaio(p.hash(), m.get("ativo", ""), m.get("variante", ""), m.get("rota", ""), m.get("periodo", ""))
+                      for p, m in ensaios}
     caminho_ensaios = getattr(cfg, "ensaios_csv", "")
-    if caminho_ensaios:
-        sr_lista.extend(ler_sr_ensaios(caminho_ensaios))
+    outros = ensaios_unicos(ler_ensaios(caminho_ensaios), chaves_corrida) if caminho_ensaios else []
+    sr_lista = [m["sr"] for _, m in ensaios] + [md.flt(ln.get("sr")) for ln in outros]
+    m_ensaios = len(ensaios) + len(outros)
     matriz = matriz_pbo(trades_por_cfg, configs, velas[0].t, velas[-1].T) if velas else []
     pbo_val = NAN
     if grelha_corrida and len(matriz) >= 16:
         pbo_val = pbo(matriz, 16)
-    dsr_val = dsr(sr_lista, met_oos["sr"], met_oos["n"], met_oos["g3"], met_oos["g4"])
+    dsr_val = dsr(sr_lista, met_oos["sr"], met_oos["n"], met_oos["g3"], met_oos["g4"], m_ensaios)
     return {
         "ativo": dados.ativo, "variante": dados.variante, "rota": dados.rota, "params": base, "hash": base.hash(),
         "periodo": periodo, "n_velas": n, "n_velas_1h": len(velas_1h), "buracos": contar_buracos(velas),
@@ -1324,7 +1380,7 @@ def walk_forward(grelha: List[Params], dados: Dados, cfg: Any) -> dict:
         "sanidade": sanidade, "janelas": janelas_res, "oos_trades": oos, "met_oos": met_oos,
         "mediana_oos": nu.mediana(conhecidas) if conhecidas else NAN,
         "fraccao_positiva": (sum(1 for x in conhecidas if x > 0.0) / len(janelas_res)) if janelas_res else NAN,
-        "wfe": wfe, "exp_is": exp_is_total, "ensaios": ensaios, "sr_lista": sr_lista, "m_ensaios": len(sr_lista),
+        "wfe": wfe, "exp_is": exp_is_total, "ensaios": ensaios, "sr_lista": sr_lista, "m_ensaios": m_ensaios,
         "matriz_pbo": matriz, "pbo": pbo_val, "dsr": dsr_val,
         "trocos": consistencia_4_trocos(oos), "p_nulo": p_nulo_de(met_oos, semente),
         "gbm": None, "placebo": None, "vivo": None, "purga_velas": purga,
@@ -1335,11 +1391,12 @@ def walk_forward(grelha: List[Params], dados: Dados, cfg: Any) -> dict:
 # ==========================================================================
 # 11.5 e 11.6 DSR, PBO, nulos e placebo
 # ==========================================================================
-def dsr(sr_lista: Sequence[float], sr_escolhido: float, n: int, g3: float, g4: float) -> float:
-    """(79)-(81) DSR = PSR(SR*) com SR* de sharpe_max_esperado(M, var dos SR das M configuracoes); nan sem SR."""
+def dsr(sr_lista: Sequence[float], sr_escolhido: float, n: int, g3: float, g4: float,
+        m: Optional[int] = None) -> float:
+    """(79)-(81) DSR = PSR(SR*) com SR* de sharpe_max_esperado(M, var dos SR conhecidos); M = numero de ensaios (defeito: os SR finitos)."""
     srs = [s for s in sr_lista if s == s]
-    m = len(srs)
-    var = statistics.variance(srs) if m >= 2 else 0.0
+    m = len(srs) if m is None else max(int(m), len(srs))
+    var = statistics.variance(srs) if len(srs) >= 2 else 0.0
     sr_estrela = rv.sharpe_max_esperado(m, var)
     return rv.psr(sr_escolhido, sr_estrela, n, g3, g4)
 
@@ -1353,7 +1410,8 @@ def nulo_gbm(params: Params, sigma_r: float, sigma_15: float, n_caminhos: int, s
              rota: str = "agressiva", horas: int = HORAS_NULO) -> dict:
     """Seccao 11.6: a regra inteira com o portao desligado sobre caminhos GBM de 15 m; a expectancia bruta deve ser zero.
 
-    Cada caminho tem 2 h_A + n_min horas de aquecimento mais `horas` de negociacao, SUB_PASSOS passos
+    Cada caminho tem ceil(4 h_A) + n_min horas de aquecimento (as mesmas do processo ao vivo e de
+    contexto_1h: 4 h_A para a ancora, n_min para o ajuste) mais `horas` de negociacao, SUB_PASSOS passos
     por vela de 15 m com desvio sigma_15 por vela (sigma_r / 2 se sigma_15 for desconhecido), e uma
     semente propria tirada de random.Random(semente). Devolve a expectancia bruta e liquida (pooled,
     com erro padrao), a distribuicao por caminho (quantil 0,95 para o criterio 6) e p_nulo do rotulo
@@ -1365,7 +1423,7 @@ def nulo_gbm(params: Params, sigma_r: float, sigma_15: float, n_caminhos: int, s
         raise ValueError("sigma_r tem de ser nao negativo")
     if not (sigma_15 == sigma_15 and sigma_15 > 0.0):
         sigma_15 = sigma_r / 2.0
-    aquecimento_h = int(math.ceil(2.0 * params.h_a + params.n_min))
+    aquecimento_h = int(math.ceil(4.0 * params.h_a)) + params.n_min
     n_15 = 4 * (aquecimento_h + max(1, int(horas)))
     rng = random.Random(semente)
     t0 = 1_700_000_000_000 - 1_700_000_000_000 % MS_DIA

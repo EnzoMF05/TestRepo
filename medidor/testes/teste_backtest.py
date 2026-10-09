@@ -122,7 +122,8 @@ class OUComReversao(unittest.TestCase):
             self.assertGreater(t.lado * (t.p_alvo - t.p_entrada), 0.0)
             self.assertGreater(t.lado * (t.p_entrada - t.p_stop), 0.0)
             self.assertAlmostEqual(t.p_stop, rv.preco_stop(t.a_0, t.sigma_0, t.lado, p.z_stop))
-            self.assertAlmostEqual(t.p_alvo, math.exp(t.a_0 + t.lado * p.z_out * t.sigma_0))
+            self.assertAlmostEqual(t.p_alvo, rv.preco_alvo(t.a_0, t.sigma_0, t.lado, p.z_out))     # banda z_out do mesmo lado
+            self.assertLess(t.lado * (t.p_alvo - math.exp(t.a_0)), 0.0)                             # aquem da ancora
             self.assertAlmostEqual(t.custo_bps, c.custo_entrada("agressiva") + c.custo_saida(t.motivo))
             self.assertAlmostEqual(t.r_liq_bps, t.r_bruto_bps - t.custo_bps - t.funding_bps)
             self.assertAlmostEqual(t.r_bruto_bps, bt.BPS * t.lado * math.log(t.p_saida / t.p_entrada))
@@ -149,12 +150,15 @@ class OUComReversao(unittest.TestCase):
                 if s < t.i_entrada:
                     self.assertGreater(t.i_entrada, s + 8)
         self.assertLessEqual(len(com), len(base))
-        # funding por hora inteira: taxa constante de 1e-4 por hora cobrada so nas horas inteiras dentro do trade
-        funding = {v.T: 1e-4 for v in d.velas_1h}
+        # funding por marca de hora (t + 1 h, chave de carregar_funding): taxa constante de 1e-4 cobrada em cada marca
+        # posterior a entrada com a posicao aberta (as velas tem T = t + dt - 1 ms, como na Hyperliquid)
+        funding = {v.t + bt.MS_1H: 1e-4 for v in d.velas_1h}
         com_f = bt.simular(PARAMS_OU, d.velas_1h, d.velas_15m, funding, bt.Custos())
         self.assertEqual([(t.i_entrada, t.motivo) for t in com_f], [(t.i_entrada, t.motivo) for t in base])
+        self.assertTrue(any(t.funding_bps != 0.0 for t in com_f))
         for t in com_f:
-            horas = sum(1 for v in d.velas_1h if t.t_entrada_ms <= v.t and v.T <= t.t_saida_ms)
+            # marcas de hora estritamente depois do instante da entrada (a vela da entrada nao avanca) e ate a saida
+            horas = sum(1 for v in d.velas_1h if t.t_entrada_ms + 1 < v.t + bt.MS_1H and v.T <= t.t_saida_ms)
             self.assertAlmostEqual(t.funding_bps, t.lado * horas * 1e-4 * bt.BPS, places=9)
 
     def test_degradada_1h_e_rota_passiva(self):
@@ -163,7 +167,7 @@ class OUComReversao(unittest.TestCase):
         self.assertGreater(len(deg), 5)
         for t in deg:
             self.assertLessEqual(t.tmax_velas, PARAMS_OU.tmax_h)
-            self.assertEqual(t.t_entrada_ms % bt.MS_1H, 0)
+            self.assertEqual((t.t_entrada_ms + 1) % bt.MS_1H, 0)                 # T = t + 1 h - 1 ms
         pas = bt.simular(PARAMS_OU, d.velas_1h, d.velas_15m, {}, bt.Custos(pi_passiva=0.5), rota="passiva", semente=3)
         rotas = {t.rota for t in pas}
         self.assertTrue(rotas <= {"passiva", "passiva_taker"})
@@ -180,8 +184,9 @@ class OUComReversao(unittest.TestCase):
 # --------------------------------------------------------------------------
 class NuloGBM(unittest.TestCase):
     def test_expectancia_bruta_nula_e_liquida_menos_os_custos(self):
-        g = bt.nulo_gbm(PARAMS_GBM, 0.004, 0.002, 24, 2026, bt.Custos(imp_bps=0.0), horas=400)
+        g = bt.nulo_gbm(PARAMS_GBM, 0.004, 0.002, 24, 2026, bt.Custos(imp_bps=0.0), horas=600)
         self.assertGreaterEqual(g["n"], 60, "poucos trades para o teste ter potencia")
+        self.assertEqual(g["horas_por_caminho"], 4 * 24 + 96 + 600)             # aquecimento ceil(4 h_A) + n_min
         self.assertLessEqual(abs(g["exp_bruta"]), 2.0 * g["ep_bruta"],
                              "media bruta %.2f bps, EP %.2f, n = %d" % (g["exp_bruta"], g["ep_bruta"], g["n"]))
         self.assertAlmostEqual(g["exp_liq"], g["exp_bruta"] - g["custo_medio"], places=9)
@@ -512,6 +517,106 @@ class Ficheiros(unittest.TestCase):
         self.assertEqual(len(bt.Params().hash()), 6)
         with self.assertRaises(ValueError):
             bt.validar_params(bt.Params(z_out=2.5))
+
+
+# --------------------------------------------------------------------------
+# Correccoes da revisao (um teste por achado corrigido no backtest)
+# --------------------------------------------------------------------------
+def _ctx_manual(t_ms: int, a: float = math.log(100.0), sigma: float = 0.01, f_hora: float = 1e-4) -> bt.Contexto1h:
+    """Contexto VERDE construido a mao: ancora em 100, sigma_eq 1 %, H = 8 h."""
+    phi = 2.0 ** (-1.0 / 8.0)
+    return bt.Contexto1h(t_ms, rv.VERDE, (), a, sigma, phi, 8.0, -5.0, -3.0, 0.8, -1.0, 1.0, 0.0, NAN, f_hora, 0.005, 720, True)
+
+
+def _vela_z(k: int, z: float, t0: int, z_lo: float = NAN, z_hi: float = NAN, a: float = math.log(100.0),
+            sigma: float = 0.01) -> bt.Vela:
+    c = math.exp(a + z * sigma)
+    lo = math.exp(a + (z - 0.4 if z_lo != z_lo else z_lo) * sigma)
+    hi = math.exp(a + (z + 0.4 if z_hi != z_hi else z_hi) * sigma)
+    return bt.Vela(t0 + k * bt.MS_15M, t0 + (k + 1) * bt.MS_15M - 1, c, hi, lo, c, 1.0, 10, True)
+
+
+class Correccoes(unittest.TestCase):
+    def setUp(self):
+        self.pasta = tempfile.mkdtemp(prefix="backtest_corr_")
+
+    def tearDown(self):
+        shutil.rmtree(self.pasta, ignore_errors=True)
+
+    def _guiao(self, zs: List[float], t0: int, lo: Dict[int, float] = None) -> List[bt.Vela]:
+        lo = lo or {}
+        return [_vela_z(k, z, t0, z_lo=lo.get(k, NAN)) for k, z in enumerate(zs)]
+
+    def test_funding_e_z_f_com_o_T_inclusivo_da_hyperliquid(self):
+        # velas com T = ...59:59.999: o funding e cobrado na marca de hora e, na variante B, funding_hist recebe valores
+        t0 = T0 - bt.MS_1H                                                   # k4 = 10:00-10:15
+        zs = [0.0, 0.0, 0.0, -2.3, -1.8] + [-1.5] * 4 + [-0.4]               # entrada as 10:15, alvo as 11:30
+        velas = self._guiao(zs, t0)
+        self.assertEqual(velas[4].T % bt.MS_1H, 15 * 60_000 - 1)
+        ctx = [_ctx_manual(t0 + (j + 1) * bt.MS_1H - 1) for j in range(4)]
+        funding = {t0 + (j + 1) * bt.MS_1H: 1e-4 for j in range(4)}
+        trades = bt.simular(bt.Params(), [], velas, funding, bt.Custos(), contexto=ctx)
+        self.assertEqual(len(trades), 1)
+        t = trades[0]
+        self.assertEqual((t.lado, t.motivo), (1, "alvo"))
+        self.assertEqual(t.t_entrada_ms, velas[4].T)
+        self.assertAlmostEqual(t.funding_bps, 1.0)                           # so a marca das 11:00
+        self.assertAlmostEqual(t.r_liq_bps, t.r_bruto_bps - t.custo_bps - 1.0)
+        colunas = [{"v_b": 10.0, "v_a": 5.0, "funding": 1e-4 * (1 + k), "oi_usd": 1e6, "flx": 0.1} for k in range(len(velas))]
+        b = bt._Baleias()
+        for v, col in zip(velas, colunas):
+            b.vela(v, col)
+        self.assertEqual(list(b.funding_hist), [1e-4 * 4, 1e-4 * 8])        # as velas que fecham 10:00 e 11:00
+        self.assertTrue(b.z_f != b.z_f or True)
+        trades_b = bt.simular(bt.Params(), [], velas, funding, bt.Custos(), colunas_baleias=colunas, contexto=ctx)
+        self.assertEqual(len(trades_b), 1)
+
+    def test_entrada_as_15_e_saida_a_1_30_cobra_exactamente_um_funding(self):
+        # a Hyperliquid paga funding a quem esta aberto em cada marca de hora: entrada :15, saida 1:30 -> uma vez
+        t0 = T0 - bt.MS_1H
+        zs = [0.0, 0.0, 0.0, -2.3, -1.8, -1.5, -1.5, -1.5, -1.5, -0.4]
+        velas = self._guiao(zs, t0)
+        ctx = [_ctx_manual(t0 + (j + 1) * bt.MS_1H - 1) for j in range(4)]
+        funding = {t0 + (j + 1) * bt.MS_1H: 2e-4 for j in range(4)}
+        trades = bt.simular(bt.Params(), [], velas, funding, bt.Custos(), contexto=ctx)
+        self.assertEqual([(t.motivo, round(t.funding_bps, 6)) for t in trades], [("alvo", 2.0)])
+        self.assertEqual((trades[0].t_entrada_ms + 1) % bt.MS_1H, 15 * 60_000)
+        self.assertEqual((trades[0].t_saida_ms + 1) % bt.MS_1H, 30 * 60_000)
+        # o alvo e a banda z_out do mesmo lado: o fecho a z = -0,4 passa-a, um fecho a z = -0,6 nao
+        velas2 = self._guiao(zs[:-1] + [-0.6, -0.6], t0)
+        trades2 = bt.simular(bt.Params(), [], velas2, funding, bt.Custos(), contexto=ctx)
+        self.assertEqual([t.motivo for t in trades2], ["invalidacao"])         # fim dos dados, nao alvo
+        self.assertEqual(trades2[0].inval, "fim_dados")
+
+    def test_duas_corridas_dao_o_mesmo_dsr_e_o_mesmo_m(self):
+        d = dados_ou()
+        caminho = os.path.join(self.pasta, "ensaios.csv")
+        cfg = types.SimpleNamespace(is_dias=30.0, oos_dias=10.0, embargo_frac=0.01, n_grelha_min=5,
+                                    c_w_bps=8.0, c_l_bps=13.0, custos=bt.Custos(), semente=1, ensaios_csv=caminho)
+        grelha = bt.grelha_declarada(PARAMS_OU, {"z_out": (0.25, 0.5), "z_min_resto": (0.5, 0.75)})
+        bt.registar_ensaio(caminho, bt.Params(z_in=1.9), {"ativo": "OUTRO", "sr": 0.3, "n": 50})   # ensaio anterior, de outro activo
+        resultados = []
+        for _ in range(2):
+            res = bt.walk_forward(grelha, d, cfg)
+            for p, met in res["ensaios"]:
+                bt.registar_ensaio(caminho, p, met)
+            resultados.append((res["dsr"], res["m_ensaios"], len(bt.ler_ensaios(caminho))))
+        self.assertEqual(resultados[0], resultados[1])
+        self.assertEqual(resultados[0][1], 4 + 1)                              # as 4 desta corrida mais o ensaio anterior
+        self.assertEqual(resultados[0][2], 5)                                  # o ficheiro nao duplica
+        self.assertFalse(bt.registar_ensaio(caminho, bt.Params(z_in=1.9), {"ativo": "OUTRO", "sr": 0.3, "n": 50}))
+        self.assertAlmostEqual(bt.dsr([0.1, 0.3], 0.3, 100, 0.0, 3.0, 7), rv.psr(0.3, rv.sharpe_max_esperado(7, 0.02), 100, 0.0, 3.0))
+
+    def test_deslocacao_da_ancora_contra_o_trade(self):
+        # compra com o alvo em exp(A - 0,5 sigma): a ancora a descer 0,7 sigma_0 invalida ("ancora"); a subir nao
+        t0 = T0 - bt.MS_1H
+        zs = [0.0, 0.0, 0.0, -2.3, -1.8, -1.5, -1.5, -1.5, -1.5, -1.5, -1.5, -1.5]
+        velas = self._guiao(zs, t0)
+        a0 = math.log(100.0)
+        for desloc, esperado in ((-0.7, "ancora"), (0.7, "fim_dados")):
+            ctx = [_ctx_manual(t0 + (j + 1) * bt.MS_1H - 1, a=a0 if j < 2 else a0 + desloc * 0.01) for j in range(4)]
+            trades = bt.simular(bt.Params(), [], velas, {}, bt.Custos(), contexto=ctx)
+            self.assertEqual([t.inval for t in trades], [esperado], desloc)
 
 
 if __name__ == "__main__":

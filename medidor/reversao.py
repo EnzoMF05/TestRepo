@@ -37,6 +37,24 @@ EULER_GAMMA = 0.5772156649015329
 JANELA_1H_MS = 3_600_000
 IMAN_ALCANCE = 0.03        # faixa de precos (3 %) onde se procura o iman (52)
 P_CAUDA_NORMAL = 0.954     # P(|z| <= 2) sob OU gaussiano (30)
+PASSO_T_CRIT = 240         # (11) t_crit calibrado por patamares de N (velas de 1 h), igual ao vivo e no backtest
+
+
+def n_calibracao(n: int, n_min: int, n_max: int, passo: int = PASSO_T_CRIT) -> int:
+    """(11) N para calibrar t_crit: 0 (sem calibracao, usa-se t_nulo_max) se n < n_min; senao min(n_max, max(n_min, n - n mod passo)).
+
+    Regra unica do sinalizador e do backtest: abaixo de n_min o ajuste nao e valido (4.3) e o
+    limiar de fallback chega; acima, patamares de `passo` velas evitam recalibrar a cada hora
+    (o quantil de 1000 replicas muda menos do que isso entre patamares).
+    """
+    if n < n_min or passo < 1:
+        return 0
+    return int(min(n_max, max(n_min, n - n % passo)))
+
+
+def n_min_quantil_z(n_z: int, n_min: int) -> int:
+    """(30) numero minimo de |z| anteriores para o quantil empirico existir: min(n_z, n_min), igual ao vivo e no backtest."""
+    return int(max(1, min(n_z, n_min)))
 
 
 def _sinal(x: float) -> int:
@@ -556,14 +574,32 @@ def hash_endereco(endereco: str) -> str:
     return hashlib.sha256(texto.encode("utf-8")).hexdigest()[:10]
 
 
+class JanelaSomaCausal(nu.JanelaSoma):
+    """nucleo.JanelaSoma cuja soma(agora) so conta os itens com agora - duracao < t <= agora.
+
+    O JanelaSoma do nucleo descarta o que e anterior a janela mas conta tudo o que ja foi
+    junto, mesmo com t posterior a `agora`; aqui o que chegou depois do instante pedido (os
+    negocios da folga entre T_k e a avaliacao, por exemplo) fica de fora, como pede a
+    seccao 5.4: as janelas de fluxo terminam em T_k. Os itens chegam por ordem de tempo.
+    """
+
+    def soma(self, agora_ms: int) -> float:
+        total = super().soma(agora_ms)
+        for t, v in reversed(self._itens):
+            if t <= agora_ms:
+                break
+            total -= v
+        return total
+
+
 class FluxoAgressor:
-    """(38)(39) V_B e V_A moveis (nucleo.JanelaSoma) e OFI = (V_B - V_A) / (V_B + V_A); nan sem volume."""
+    """(38)(39) V_B e V_A moveis (JanelaSomaCausal sobre nucleo.JanelaSoma) e OFI = (V_B - V_A) / (V_B + V_A); nan sem volume."""
 
     def __init__(self, janela_ms: int):
         if janela_ms <= 0:
             raise ValueError("janela_ms tem de ser positiva")
-        self._vb = nu.JanelaSoma(janela_ms)
-        self._va = nu.JanelaSoma(janela_ms)
+        self._vb = JanelaSomaCausal(janela_ms)
+        self._va = JanelaSomaCausal(janela_ms)
 
     def negocio(self, t_ms: int, s: int, ntl: float) -> None:
         if ntl != ntl or ntl < 0.0:
@@ -656,6 +692,10 @@ class NegociosGrandes:
     def _desde(self, limite_ms: int, agora_ms: int) -> List[_Negocio]:
         return [n for n in self._neg if limite_ms < n[0] <= agora_ms]
 
+    def n_grandes(self, t0_ms: int, t1_ms: int) -> int:
+        """(41) numero de negocios grandes com t0 <= time <= t1 (a vela [t, T]); os posteriores a T nao contam."""
+        return sum(1 for n in self._neg if n[7] and t0_ms <= n[0] <= t1_ms)
+
     def flx(self, agora_ms: int) -> float:
         """(42) FLX_1h = soma_{grandes} s ntl / soma_{grandes} ntl na ultima hora; nan sem grandes."""
         liquido = 0.0
@@ -688,21 +728,19 @@ class NegociosGrandes:
             rep += 1 if liquido[h] > 0.0 else -1
         return rep
 
-    def rajada_contra(self, agora_ms: int, lado: int, silencio_s: float, dt_ms: int, amp_bps: float) -> bool:
-        """(47)(48) existe bloco do mesmo agressor e lado (intervalos <= dt_ms) com soma ntl >= Q99 e amplitude >= amp_bps, do lado -lado, acabado ha menos de silencio_s."""
-        if lado not in (1, -1):
-            raise ValueError("lado tem de ser +1 ou -1")
+    def rajadas(self, agora_ms: int, silencio_s: float, dt_ms: int, amp_bps: float) -> List[Tuple[int, int, str]]:
+        """(47) rajadas (raj_ms, s_raj, hash do agressor) acabadas em [agora - silencio_s, agora]: blocos do mesmo agressor e lado com intervalos <= dt_ms, soma ntl >= Q99 e amplitude >= amp_bps; por ordem de tempo."""
         q = self.q99()
         if q != q:
-            return False
+            return []
         amp_min = amp_bps / BPS
         limite = agora_ms - int(silencio_s * 1000)
         # bloco aberto por agressor: [t_ultimo, px_primeiro, px_ultimo, s, soma_ntl]
         blocos: Dict[str, List[float]] = {}
+        saida: List[Tuple[int, int, str]] = []
 
-        def contra(b: List[float]) -> bool:
-            return (b[3] == -lado and b[4] >= q and abs(math.log(b[2] / b[1])) >= amp_min
-                    and limite <= b[0] <= agora_ms)
+        def qualifica(b: List[float]) -> bool:
+            return b[4] >= q and abs(math.log(b[2] / b[1])) >= amp_min and limite <= b[0] <= agora_ms
 
         for n in self._neg:
             t, s, ntl, h, _, px = n[0], n[1], n[2], n[3], n[4], n[5]
@@ -714,30 +752,50 @@ class NegociosGrandes:
                 b[2] = px
                 b[4] += ntl
                 continue
-            if b is not None and contra(b):
-                return True
+            if b is not None and qualifica(b):
+                saida.append((int(b[0]), int(b[3]), h))
             blocos[h] = [t, px, px, s, ntl]
-        return any(contra(b) for b in blocos.values())
+        for h, b in blocos.items():
+            if qualifica(b):
+                saida.append((int(b[0]), int(b[3]), h))
+        saida.sort()
+        return saida
+
+    def rajada_contra(self, agora_ms: int, lado: int, silencio_s: float, dt_ms: int, amp_bps: float) -> bool:
+        """(47)(48) existe bloco do mesmo agressor e lado (intervalos <= dt_ms) com soma ntl >= Q99 e amplitude >= amp_bps, do lado -lado, acabado ha menos de silencio_s."""
+        if lado not in (1, -1):
+            raise ValueError("lado tem de ser +1 ou -1")
+        return any(s == -lado for _, s, _ in self.rajadas(agora_ms, silencio_s, dt_ms, amp_bps))
+
+    def lado_rajada(self, agora_ms: int, silencio_s: float, dt_ms: int, amp_bps: float) -> int:
+        """(47) lado s em {-1, 0, +1} da ultima rajada acabada ha menos de silencio_s (0 sem rajada): a coluna raj das velas, independente do sinal."""
+        lista = self.rajadas(agora_ms, silencio_s, dt_ms, amp_bps)
+        return lista[-1][1] if lista else 0
 
     def twap(self, agora_ms: int, lado: int, cfg: ParametrosTwap) -> Tuple[int, str]:
-        """(49) -1 se ha agressor com >= min_negocios fatias em cadencia [dt_min, dt_max] s na janela do lado -lado, +1 do lado lado, 0 senao; fonte 'hash' ou 'cad'."""
+        """(49) -1 se ha agressor com >= min_negocios fatias em cadencia [dt_min, dt_max] s na janela do lado -lado, +1 do lado lado, 0 senao; fonte 'hash' ou 'cad'.
+
+        Uma fatia e o conjunto dos negocios do mesmo agressor e lado no mesmo instante (uma
+        ordem que cruza varios niveis do livro gera varios negocios com o mesmo time): conta-se
+        e mede-se a cadencia sobre os instantes distintos.
+        """
         if lado not in (1, -1):
             raise ValueError("lado tem de ser +1 ou -1")
         fonte = "hash" if cfg.usar_hash else "cad"
-        tempos: Dict[Tuple[str, int], List[int]] = {}
+        tempos: Dict[Tuple[str, int], Set[int]] = {}
         for n in self._desde(agora_ms - int(cfg.janela_s * 1000), agora_ms):
             if cfg.usar_hash and not n[6]:
                 continue
             if not n[3]:
                 continue
-            tempos.setdefault((n[3], n[1]), []).append(n[0])
+            tempos.setdefault((n[3], n[1]), set()).add(n[0])
         dt_min = cfg.dt_min_s * 1000.0
         dt_max = cfg.dt_max_s * 1000.0
         lados: Set[int] = set()
-        for (_, s), ts in tempos.items():
+        for (_, s), instantes in tempos.items():
+            ts = sorted(instantes)
             if len(ts) < cfg.min_negocios:
                 continue
-            ts.sort()
             if all(dt_min <= ts[i] - ts[i - 1] <= dt_max for i in range(1, len(ts))):
                 lados.add(s)
         if -lado in lados:
@@ -997,9 +1055,28 @@ def preco_stop(a0: float, sigma0: float, lado: int, z_stop: float) -> float:
     return math.exp(a0 - lado * z_stop * sigma0)
 
 
+def preco_alvo(a0: float, sigma0: float, lado: int, z_out: float) -> float:
+    """(58)(59) P_alvo = exp(A_0 - lado z_out sigma_0): banda z_out do MESMO lado da entrada (a ultima meia sigma antes da ancora)."""
+    # NOTA ESPEC: a seccao 7.5 escreve P_alvo = exp(A_0 + lado z_out sigma_0), que e a banda do lado
+    # OPOSTO da ancora (numa compra com z_0 = -1,9 seria z = +0,5, a 2,4 sigma da entrada) e contradiz
+    # (58), que limita G a |d_0| - z_out sigma_0, (62), que e a probabilidade de |z| tocar z_out antes de
+    # z_stop do mesmo lado, G3 (caminho |z_k| - z_out) e a definicao de z_out como a ultima meia sigma
+    # antes da ancora. Implementa-se o mesmo lado, na convencao de sinal de preco_stop.
+    if lado not in (1, -1):
+        raise ValueError("lado tem de ser +1 ou -1")
+    if not (sigma0 == sigma0 and sigma0 > 0.0) or z_out < 0.0:
+        raise ValueError("sigma_0 tem de ser positivo e z_out nao negativo")
+    return math.exp(a0 - lado * z_out * sigma0)
+
+
 def invalidar(t_nulo: float, vr: float, z_vr: float, z_abs: float, desloc_alvo_sigma: float,
               cfg: ParametrosContexto) -> Optional[str]:
-    """(60) primeiro motivo de invalidacao em (nulo, vr, z_veto, ancora) ou None; nan nao invalida."""
+    """(60) primeiro motivo de invalidacao em (nulo, vr, z_veto, ancora) ou None; nan nao invalida.
+
+    desloc_alvo_sigma = -lado (A_t - A_0) / sigma_0: deslocacao do alvo (banda z_out do mesmo lado,
+    preco_alvo) pela ancora reestimada, em sigma_0, positiva quando a ancora se afastou do lado em
+    que o trade aposta (numa compra, a ancora a descer baixa o destino esperado da reversao).
+    """
     if t_nulo == t_nulo and t_nulo > cfg.t_amarelo:
         return "nulo"
     if vr == vr and z_vr == z_vr and vr > cfg.vr_veto and z_vr > cfg.zvr_veto:
@@ -1484,7 +1561,8 @@ def pbo_cscv(matriz: Sequence[Sequence[float]], s: int = 16) -> float:
     """(81) PBO por CSCV: S blocos contiguos de trades, somas por bloco, metade IS e metade OOS em todas as combinacoes; PBO = fraccao de lambda = ln(w / (1 - w)) <= 0.
 
     w e o rank OOS (ascendente, 1 = pior) da configuracao melhor em IS dividido por N + 1,
-    o que mantem lambda finito; empates contam como posicoes abaixo ou iguais.
+    o que mantem lambda finito; nos empates conta-se o rank medio das empatadas (uma matriz
+    em que nada distingue as configuracoes da w = 0,5, lambda = 0 e PBO = 1, nunca 0).
     """
     if s < 2 or s % 2:
         raise ValueError("s tem de ser par e pelo menos 2")
@@ -1516,7 +1594,8 @@ def pbo_cscv(matriz: Sequence[Sequence[float]], s: int = 16) -> float:
         melhor = max(range(n_cfg), key=lambda j: perf_is[j])
         perf_oos = [total[j] - perf_is[j] for j in range(n_cfg)]
         ordenado = sorted(perf_oos)
-        rank = bisect.bisect_right(ordenado, perf_oos[melhor])
+        v = perf_oos[melhor]
+        rank = 0.5 * (bisect.bisect_left(ordenado, v) + bisect.bisect_right(ordenado, v) + 1)
         w = rank / (n_cfg + 1.0)
         if math.log(w / (1.0 - w)) <= 0.0:
             n_sobre += 1
