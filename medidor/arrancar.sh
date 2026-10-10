@@ -4,7 +4,7 @@
 #   bash arrancar.sh               corre o medidor (Ctrl+C para parar)
 #   bash arrancar.sh relatorio     mostra o resumo do que foi medido
 #   bash arrancar.sh sinal BTC compra
-#   bash arrancar.sh sinalizador verificar   (ou historico, correr, baleias, relatorio, ensaios, reset)
+#   bash arrancar.sh sinalizador verificar   (ou historico, correr, teste3sigma, baleias, relatorio, ensaios, reset)
 cd "$(dirname "$0")" || exit 1
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Nao encontrei o python3. Instale o Python em https://www.python.org/downloads/ e repita."

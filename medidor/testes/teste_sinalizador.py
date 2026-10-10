@@ -96,7 +96,8 @@ class Captura(logging.Handler):
 class Base(unittest.TestCase):
     EXTRA = ""
     INI = ("[geral]\nativos = BTC, ETH\n[sombra]\njanela_sinal_s = 900\n"
-           "horizontes_s = 5, 30, 60, 300, 900, 3600, 14400\nhorizonte_regra_s = 3600\n[sinalizador]\n")
+           "horizontes_s = 5, 30, 60, 300, 900, 3600, 14400\nhorizonte_regra_s = 3600\n[sinalizador]\n"
+           "emitir = sim\n")                     # os testes das pecas de emissao precisam dela ligada
 
     def setUp(self) -> None:
         self.pasta = tempfile.mkdtemp(prefix="sinalizador_teste_")
@@ -118,8 +119,11 @@ class Base(unittest.TestCase):
 
     def config(self, extra: str, nome: str = "config.ini") -> sn.ConfigSinalizador:
         caminho = os.path.join(self.pasta, nome)
+        base = self.INI
+        if "emitir =" in extra:                     # o teste decide a emissao; evita a opcao duplicada
+            base = base.replace("emitir = sim\n", "")
         with open(caminho, "w", encoding="utf-8") as f:
-            f.write(self.INI + extra)
+            f.write(base + extra)
         return sn.ConfigSinalizador(caminho)
 
     def ler(self, caminho: str) -> List[Dict[str, str]]:
@@ -1719,6 +1723,70 @@ class Notificacao(Base):
     def test_chave_notificar_no_config(self):
         self.assertTrue(self.cfg.p.notificar)
         self.assertFalse(self.config("notificar = nao\n", "n.ini").p.notificar)
+
+
+class EmissaoDesligada(Base):
+    """Por defeito o sinalizador nao escreve em sinais.csv e corre o teste pre-registado so em registo."""
+
+    def test_defeitos_e_chaves(self):
+        caminho = os.path.join(self.pasta, "minimo.ini")
+        with open(caminho, "w", encoding="utf-8") as f:
+            f.write("[geral]\nativos = BTC\n[sinalizador]\n")   # sem a chave: o defeito e nao emitir
+        minimo = sn.ConfigSinalizador(caminho)
+        self.assertFalse(minimo.p.emitir)
+        self.assertTrue(minimo.p.teste3)
+        cfg = self.config("emitir = sim\nteste3 = nao\n", "e.ini")
+        self.assertTrue(cfg.p.emitir)
+        self.assertFalse(cfg.p.teste3)
+
+    def test_fecho_com_sinal_nao_escreve_em_sinais_csv(self):
+        cfg = self.config("emitir = nao\n", "off.ini")
+        s = sn.Sinalizador(cfg, {"BTC": 5, "ETH": 4})
+        at = s.ativos["BTC"]
+        self.assertIsNotNone(at.teste3)
+        self.assertTrue(os.path.exists(self.cfg.reg_teste3))
+        sinal = rv.Sinal(T0, "BTC", 1, 100.0, 50.0, 1000.0, "revou v=2")
+        with mock.patch.object(at, "fecho_15m", return_value=(sinal, "ok")), \
+             mock.patch.object(at, "avancar_trade_virtual", return_value=None):
+            s._fechar(("BTC", "15m"), rv.Vela(T0, T0 + 900_000 - 1, 100.0, 100.5, 99.5, 100.2, 1.0, 1), T0 + 1000)
+        self.assertFalse(os.path.exists(cfg.sinais_csv) and os.path.getsize(cfg.sinais_csv) > len(sn.CAB_SINAIS) + 2)
+        self.assertIn("NAO emitido", self.captura.texto())
+
+    def test_comando_teste3sigma_recusa_antes_de_100(self):
+        s = sn.Sinalizador(self.cfg, {"BTC": 5, "ETH": 4})
+        s.ativos["BTC"].registo_teste3.escrever({"id": "BTC-1", "ativo": "BTC", "R": "0.5", "entrada": "100", "stop": "99"})
+        res = sn.resumo_teste3(sn._ler_csv(self.cfg.reg_teste3))
+        self.assertEqual(res["n"], 1)
+        self.assertFalse(res["avaliavel"])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            sn.cmd_teste3sigma(self.cfg)
+        self.assertIn("Faltam 99", buf.getvalue())
+
+    def test_resumo_com_100_trades(self):
+        linhas = [{"id": "BTC-%d" % i, "ativo": ["BTC", "ETH", "SOL"][i % 3], "R": "0.5" if i % 2 else "-0.2", "entrada": "100", "stop": "99"} for i in range(100)]
+        res = sn.resumo_teste3(linhas)
+        self.assertTrue(res["avaliavel"] and res["h1"])
+        self.assertAlmostEqual(res["media"], 0.15)
+        self.assertAlmostEqual(res["pf"], 25.0 / 10.0)
+        self.assertAlmostEqual(res["nula"], -13.0 / 100.0)
+        self.assertTrue(res["h4"] and res["h6"])
+        self.assertLessEqual(res["dd_ativo"], res["dd"])
+
+    def test_h5_e_por_activo_como_pre_registado(self):
+        # 3 activos, cada um com uma sequencia de 11 perdas de -1 R (DD 11 R por activo, 33 R no total)
+        linhas = [{"id": "%s-%d" % (a, i), "ativo": a, "R": "-1.0", "entrada": "100", "stop": "99"}
+                  for a in ("BTC", "ETH", "SOL") for i in range(11)]
+        res = sn.resumo_teste3(linhas, minimo=10)
+        self.assertAlmostEqual(res["dd"], 33.0)
+        self.assertAlmostEqual(res["dd_ativo"], 11.0)
+        self.assertFalse(res["h5"])
+        # com 9 perdas por activo (DD 9 R por activo, 27 R no total) H5 passa por activo e falharia no total
+        linhas = [ln for ln in linhas if int(ln["id"].split("-")[1]) < 9]
+        res = sn.resumo_teste3(linhas, minimo=10)
+        self.assertAlmostEqual(res["dd"], 27.0)
+        self.assertAlmostEqual(res["dd_ativo"], 9.0)
+        self.assertTrue(res["h5"])
 
 
 if __name__ == "__main__":

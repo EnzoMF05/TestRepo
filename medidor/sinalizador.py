@@ -89,6 +89,8 @@ COLUNAS_REGISTO = ["id", "hora", "ativo", "lado", "preco", "A_0", "sigma_0", "ph
 COLUNAS_BALEIAS = ["prefixo", "hash", "valor_usd", "roi_semana", "roi_mes", "vlm_mes", "hora_utc"]
 COLUNAS_ENSAIOS = ["data", "hash", "n", "expectancia_bps", "ep_bps", "sr", "parametros"]
 SESSOES = ("asia", "europa", "eua", "fds")
+COLUNAS_TESTE3 = ["id", "hora_sinal", "ativo", "lado", "z", "preco_sinal", "entrada", "stop", "alvo", "hora_saida",
+                  "saida", "motivo", "velas", "r_bruto_bps", "r_liq_bps", "R"]
 MOTIVOS_SAIDA = ("alvo", "stop", "tempo", "invalidacao")
 
 
@@ -196,6 +198,8 @@ class ParametrosSinalizador:
     arrefecimento_velas: int = 2
     lado_por_tick: bool = False        # H2 falhada em verificar: lado do negocio pelo tick
     notificar: bool = True             # notificacao do macOS (osascript) quando um sinal e escrito
+    emitir: bool = False               # escrever em sinais.csv; a regra REVOU v2 foi falsificada: desligado por defeito
+    teste3: bool = True                # registo virtual do teste pre-registado de 3 sigma (SINTESE 8.1)
     veto_sessao: Tuple[str, ...] = ()
     enderecos_excluidos: Tuple[str, ...] = ()
     pasta_velas: str = "dados/velas"
@@ -259,7 +263,7 @@ class ConfigSinalizador(Config):
             g_min_x_custo=f("g_min_x_custo", 3.0), custo_taxa_entrada_bps=f("custo_taxa_entrada_bps", 4.5),
             imp_defeito_bps=f("imp_defeito_bps", 2.0), c_w_bps=f("c_w_bps", 8.0), c_l_bps=f("c_l_bps", 13.0),
             arrefecimento_velas=i("arrefecimento_velas", 2), lado_por_tick=_sim(g("lado_por_tick", "nao")),
-            notificar=_sim(g("notificar", "sim")),
+            notificar=_sim(g("notificar", "sim")), emitir=_sim(g("emitir", "nao")), teste3=_sim(g("teste3", "sim")),
             veto_sessao=sessoes, enderecos_excluidos=excluidos,
             pasta_velas=pasta_velas, url_leaderboard=g("url_leaderboard", ParametrosSinalizador.url_leaderboard))
         self.p_ctx = rv.ParametrosContexto(
@@ -292,6 +296,7 @@ class ConfigSinalizador(Config):
         self.pasta_funding = os.path.join(self.pasta, "funding")
         self.reg_sinalizador = os.path.join(self.pasta, "registo_sinalizador.csv")
         self.estado_sinalizador_json = os.path.join(self.pasta, "estado_sinalizador.json")
+        self.reg_teste3 = os.path.join(self.pasta, "registo_teste_3sigma.csv")
         self.baleias_csv = os.path.join(self.pasta, "baleias.csv")
         self.ensaios_csv = os.path.join(self.pasta, "ensaios.csv")
         self.log_sinalizador = os.path.join(self.pasta, "sinalizador.log")
@@ -851,6 +856,10 @@ class ActivoSinal:
         self.arrefecimento = 0
         self.t_stop_ms = 0
         self.fechados: List[Dict[str, Any]] = []
+        # teste pre-registado de 3 sigma: so registo virtual, nunca sinais; ids ja gravados nao se repetem
+        self.teste3: Optional[rv.TesteTresSigma] = rv.TesteTresSigma() if cfg.p.teste3 else None
+        self.registo_teste3 = Registo(cfg.reg_teste3, COLUNAS_TESTE3) if cfg.p.teste3 else None
+        self.teste3_ids: Set[str] = {str(ln.get("id", "")) for ln in _ler_csv(cfg.reg_teste3)} if cfg.p.teste3 else set()
         self.ids_fechados: Set[str] = set()
         self.stops_seguidos = 0
         self.registo: Optional[Registo] = None
@@ -1084,6 +1093,7 @@ class ActivoSinal:
         """
         p, cfg = self.cfg.p, self.cfg
         T = vela.T
+        self._teste3(vela)
         x = math.log(vela.c)
         r_k = x - self.x_15m_ant if self.x_15m_ant == self.x_15m_ant else NAN
         self.x_15m_ant = x
@@ -1286,6 +1296,32 @@ class ActivoSinal:
         return sinal, "ok", "B=%d f_B=%.2f %s" % (b, f_b, tam.cap)
 
     # ---- trade virtual (seccao 7.5) ----------------------------------------------
+    def _teste3(self, vela: Vela) -> None:
+        """Teste pre-registado 8.1 (registo virtual): corre no historico e ao vivo; grava so sinais apos TESTE3_DESDE."""
+        if self.teste3 is None or self.registo_teste3 is None:
+            return
+        try:
+            fechado, sinal = self.teste3.fecho(vela)
+        except Exception as e:  # nunca pode parar o ciclo principal
+            log.warning("%s teste 3 sigma: %s", self.nome, e)
+            return
+        if sinal and sinal["t_ms"] >= rv.TESTE3_DESDE_MS:
+            log.info("%s teste 3 sigma: sinal VIRTUAL %s z %.2f em %.6g (nao emitido)", self.nome,
+                     "compra" if sinal["lado"] > 0 else "venda", sinal["z"], sinal["preco"])
+        if fechado and fechado["t_sinal"] and fechado["t_sinal"] >= rv.TESTE3_DESDE_MS:
+            ident = "%s-%d" % (self.nome, fechado["t_sinal"])
+            if ident in self.teste3_ids:
+                return
+            self.teste3_ids.add(ident)
+            self.registo_teste3.escrever({
+                "id": ident, "hora_sinal": iso_utc(fechado["t_sinal"]), "ativo": self.nome,
+                "lado": "compra" if fechado["lado"] > 0 else "venda", "z": num(fechado["z"], 3),
+                "preco_sinal": num(fechado["preco_sinal"], 8), "entrada": num(fechado["entrada"], 8),
+                "stop": num(fechado["stop"], 8), "alvo": num(fechado["alvo"], 8), "hora_saida": iso_utc(fechado["t_saida"]),
+                "saida": num(fechado["saida"], 8), "motivo": fechado["motivo"], "velas": fechado["velas"],
+                "r_bruto_bps": num(fechado["r_bruto_bps"], 2), "r_liq_bps": num(fechado["r_liq_bps"], 2), "R": num(fechado["R"], 4)})
+            log.info("%s teste 3 sigma: trade virtual fechado por %s, %s R", self.nome, fechado["motivo"], num(fechado["R"], 3))
+
     def _abrir_trade(self, vela: Vela, agora_ms_: int, lado: int, p_alvo: float, p_stop: float, tmax_15: int,
                      g: float, l_bps: float, fase: str, f_b: float, tamanho: float, nota: str, z_0: float) -> None:
         self.n_sinal += 1
@@ -1984,7 +2020,10 @@ class Sinalizador:
                             % (linha.get("preco_saida", "?"), linha.get("r_liq_bps", "?")))
         res = self._passo("fecho 15m " + nome, at.fecho_15m, vela, agora, avaliar)
         sinal, motivo = res if res else (None, "erro")
-        if sinal is not None:
+        if sinal is not None and not self.cfg.p.emitir:
+            log.info("%s: sinal REVOU %s NAO emitido (emitir = nao): a regra foi falsificada; fica no registo virtual",
+                     nome, "compra" if sinal.lado > 0 else "venda")
+        elif sinal is not None:
             t_escrita = self._passo("escrita " + nome, escrever_sinal, self.cfg, sinal)
             if t_escrita and self.cfg.p.notificar:
                 lado_txt = "compra" if sinal.lado > 0 else "venda"
@@ -2376,6 +2415,10 @@ async def _correr(cfg: ConfigSinalizador) -> None:
         log.warning("Nao li o maxLeverage da meta (%s); a nota fica com lev=na", e)
         lev = {}
     s = Sinalizador(cfg, sz, lev)
+    if not cfg.p.emitir:
+        log.warning("Emissao de sinais DESLIGADA (emitir = nao): a regra REVOU v2 foi falsificada em dados reais "
+                    "(pesquisa/relatorios/SINTESE.md). O sinalizador recolhe dados da Hyperliquid, regista trades "
+                    "virtuais e corre o teste pre-registado de 3 sigma; nao escreve em sinais.csv.")
     await s.arrancar()
 
 
@@ -2670,6 +2713,70 @@ def cmd_ensaios(cfg: ConfigSinalizador) -> None:
             ln.get("ep_bps") or "-", ln.get("sr") or "-", "  <- em vigor" if ln.get("hash") == cfg.variante else ""))
 
 
+def resumo_teste3(linhas: List[Dict[str, str]], minimo: int = 100, custo_bps: float = 6.5) -> Dict[str, Any]:
+    """Metricas do teste pre-registado em R: n, media, erro padrao, PF, acerto, DD (total e por activo), metades, nula.
+
+    H5 e por activo, como pre-registado na SINTESE 8.1 (o DD de todos os activos juntos cresce com o
+    numero de activos e reprova vantagens reais; fica impresso so para informacao).
+    """
+    rs = [flt(ln.get("R")) for ln in linhas]
+    rs = [x for x in rs if x == x]
+    n = len(rs)
+    out: Dict[str, Any] = {"n": n, "minimo": minimo, "avaliavel": n >= minimo}
+    if n == 0:
+        return out
+    media = sum(rs) / n
+    var = sum((x - media) ** 2 for x in rs) / (n - 1) if n > 1 else NAN
+    ganhos, perdas = sum(x for x in rs if x > 0), -sum(x for x in rs if x < 0)
+    acum, pico, dd = 0.0, 0.0, 0.0
+    for x in rs:
+        acum += x
+        pico = max(pico, acum)
+        dd = max(dd, pico - acum)
+    por_ativo: Dict[str, float] = {}
+    curvas: Dict[str, Tuple[float, float, float]] = {}     # por activo: (acumulado, pico, DD), como pre-registado
+    for ln in linhas:
+        x = flt(ln.get("R"))
+        if x == x:
+            a = ln.get("ativo", "?")
+            por_ativo[a] = por_ativo.get(a, 0.0) + x
+            ac, pc, d = curvas.get(a, (0.0, 0.0, 0.0))
+            ac += x
+            pc = max(pc, ac)
+            curvas[a] = (ac, pc, max(d, pc - ac))
+    dd_ativo = max((c[2] for c in curvas.values()), default=0.0)
+    meio = n // 2
+    r_bps = [flt(ln.get("entrada")) and abs(flt(ln.get("entrada")) - flt(ln.get("stop"))) / flt(ln.get("entrada")) * nu.BPS for ln in linhas]
+    r_bps = [x for x in r_bps if x == x and x > 0]
+    nula = -2.0 * custo_bps / (sum(r_bps) / len(r_bps)) if r_bps else NAN
+    out.update({"media": media, "erro_padrao": math.sqrt(var / n) if var == var else NAN,
+                "pf": ganhos / perdas if perdas > 0 else float("inf"), "acerto": sum(1 for x in rs if x > 0) / n,
+                "dd": dd, "dd_ativo": dd_ativo, "por_ativo": por_ativo, "metades": (sum(rs[:meio]), sum(rs[meio:])), "nula": nula,
+                "h1": n >= minimo, "h2": media >= 0.15, "h3": (ganhos / perdas if perdas > 0 else float("inf")) >= 1.3,
+                "h4": sum(1 for v in por_ativo.values() if v > 0) >= 3, "h5": dd_ativo <= 10.0,
+                "h6": sum(rs[:meio]) > 0 and sum(rs[meio:]) > 0})
+    return out
+
+
+def cmd_teste3sigma(cfg: ConfigSinalizador) -> None:
+    """Avaliacao UNICA do teste pre-registado: recusa-se a mostrar metricas antes de 100 trades."""
+    linhas = _ler_csv(cfg.reg_teste3)
+    res = resumo_teste3(linhas)
+    print("TESTE PRE-REGISTADO 8.1 (ressalto de 2 h depois de 3 sigma): %d trades virtuais registados" % res["n"])
+    if not res["avaliavel"]:
+        print("Faltam %d trades para a avaliacao unica (minimo %d). Nao se olha antes: e pre-registo." % (res["minimo"] - res["n"], res["minimo"]))
+        return
+    print("media %.3f R (erro padrao %.3f) | PF %.2f | acerto %.1f %% | DD %.1f R (pior activo %.1f R) | nula %.3f R" % (
+        res["media"], res["erro_padrao"], res["pf"], 100 * res["acerto"], res["dd"], res["dd_ativo"], res["nula"]))
+    print("por activo: " + ", ".join("%s %+.1f" % kv for kv in sorted(res["por_ativo"].items())))
+    print("metades: %+.1f / %+.1f R" % res["metades"])
+    for k, txt in (("h1", "n >= 100"), ("h2", "media >= +0,15 R"), ("h3", "PF >= 1,3"), ("h4", "positivo em >= 3 activos"),
+                   ("h5", "DD <= 10 R por activo"), ("h6", "duas metades positivas")):
+        print("  %s %s: %s" % (k.upper(), txt, "PASSA" if res[k] else "falha"))
+    print("Veredicto: %s" % ("PASSA todos os criterios; so agora faz sentido pensar em emitir." if all(res[k] for k in ("h1", "h2", "h3", "h4", "h5", "h6"))
+                             else "nao passa; a hipotese fica rejeitada e nao se afina nada."))
+
+
 def cmd_reset(cfg: ConfigSinalizador) -> None:
     """Levanta os disjuntores em estado_sinalizador.json (escrita atomica); o sinalizador a correr le-o no arranque seguinte."""
     doc: Dict[str, Any] = {}
@@ -2874,6 +2981,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     sub.add_parser("relatorio", help="cruza o registo proprio com o do medidor")
     sub.add_parser("ensaios", help="lista as configuracoes experimentadas")
     sub.add_parser("reset", help="levanta os disjuntores")
+    sub.add_parser("teste3sigma", help="avaliacao unica do teste pre-registado de 3 sigma (so com 100 trades)")
     args = ap.parse_args(argv)
     cfg = ConfigSinalizador(args.config)
     os.makedirs(cfg.pasta, exist_ok=True)
@@ -2894,6 +3002,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         cmd_ensaios(cfg)
     elif args.cmd == "reset":
         cmd_reset(cfg)
+    elif args.cmd == "teste3sigma":
+        cmd_teste3sigma(cfg)
     else:
         cmd_correr(cfg)
 

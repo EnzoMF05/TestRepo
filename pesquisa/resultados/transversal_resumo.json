@@ -1,0 +1,220 @@
+{
+ "natural_IS": {
+  "n": 564.0,
+  "media": -0.1222,
+  "erro_padrao": 0.0413,
+  "mediana": -0.2778,
+  "soma": -68.9255,
+  "PF": 0.7434,
+  "taxa_acerto": 0.4344,
+  "dd_max": 90.671,
+  "R_bruto_medio": -0.0969,
+  "duracao_h_media": 35.2881,
+  "frac_stop": 0.4113,
+  "frac_alvo": 0.0
+ },
+ "nula_IS": {
+  "n": 1491.0,
+  "media": 0.0132,
+  "erro_padrao": 0.025,
+  "mediana": -0.0687,
+  "soma": 19.7007,
+  "PF": 1.0384,
+  "taxa_acerto": 0.4681,
+  "dd_max": 42.6058,
+  "R_bruto_medio": 0.0394,
+  "duracao_h_media": 41.8979,
+  "frac_stop": 0.2508,
+  "frac_alvo": 0.0
+ },
+ "natural_pernaBTC_IS": {
+  "n": 564.0,
+  "media": -0.1398,
+  "erro_padrao": 0.0324,
+  "mediana": -0.2091,
+  "soma": -78.8725,
+  "PF": 0.6354,
+  "taxa_acerto": 0.4007,
+  "dd_max": 82.3232,
+  "R_bruto_medio": -0.0891,
+  "duracao_h_media": 35.2881,
+  "frac_stop": 0.4113,
+  "frac_alvo": 0.0
+ },
+ "grelha": {
+  "M": 48,
+  "n_positivas": 4,
+  "melhor_media": 0.07737849708437343,
+  "pior_media": -0.15941350819097994,
+  "escolha": null
+ },
+ "OOS_5": {
+  "cfg": {
+   "h": 24,
+   "z": 2.0,
+   "stop_sigma": 1.5,
+   "n_max": 192,
+   "filtro": 0
+  },
+  "metricas": {
+   "n": 351.0,
+   "media": 0.007,
+   "erro_padrao": 0.0578,
+   "mediana": -0.0321,
+   "soma": 2.4735,
+   "PF": 1.0169,
+   "taxa_acerto": 0.4815,
+   "dd_max": 36.8424,
+   "R_bruto_medio": 0.0355,
+   "duracao_h_media": 35.8355,
+   "frac_stop": 0.3618,
+   "frac_alvo": 0.0
+  },
+  "criterios": {
+   "H1": true,
+   "H2": false,
+   "H3": false,
+   "H4": false,
+   "H5": false,
+   "H6": false
+  },
+  "passa": false,
+  "por_activo": {
+   "BNB": -0.0622,
+   "DOGE": 0.0719,
+   "ETH": -0.0032,
+   "SOL": -0.0998,
+   "XRP": 0.1098
+  },
+  "por_ano": {
+   "2025": 0.0351,
+   "2026": -0.0257
+  },
+  "por_metade": {
+   "1.a": 3.031,
+   "2.a": -0.557
+  }
+ },
+ "nula_OOS": {
+  "n": 1145.0,
+  "media": -0.0845,
+  "erro_padrao": 0.0307,
+  "mediana": -0.1558,
+  "soma": -96.8031,
+  "PF": 0.7891,
+  "taxa_acerto": 0.4297,
+  "dd_max": 144.4346,
+  "R_bruto_medio": -0.0557,
+  "duracao_h_media": 40.3386,
+  "frac_stop": 0.2969,
+  "frac_alvo": 0.0
+ },
+ "OOS_5_pernaBTC": {
+  "n": 351.0,
+  "media": -0.0379,
+  "erro_padrao": 0.0381,
+  "mediana": -0.0632,
+  "soma": -13.2916,
+  "PF": 0.875,
+  "taxa_acerto": 0.4701,
+  "dd_max": 23.4824,
+  "R_bruto_medio": 0.0241,
+  "duracao_h_media": 35.8355,
+  "frac_stop": 0.3618,
+  "frac_alvo": 0.0
+ },
+ "IS_17": {
+  "n": 1980.0,
+  "media": -0.0948,
+  "erro_padrao": 0.0223,
+  "mediana": -0.2134,
+  "soma": -187.7461,
+  "PF": 0.794,
+  "taxa_acerto": 0.4308,
+  "dd_max": 240.8581,
+  "R_bruto_medio": -0.071,
+  "duracao_h_media": 36.0426,
+  "frac_stop": 0.3965,
+  "frac_alvo": 0.0
+ },
+ "OOS_17": {
+  "metricas": {
+   "n": 1247.0,
+   "media": 0.0234,
+   "erro_padrao": 0.0301,
+   "mediana": -0.0364,
+   "soma": 29.1338,
+   "PF": 1.0561,
+   "taxa_acerto": 0.4812,
+   "dd_max": 57.0814,
+   "R_bruto_medio": 0.0502,
+   "duracao_h_media": 36.5585,
+   "frac_stop": 0.3601,
+   "frac_alvo": 0.0
+  },
+  "criterios": {
+   "H1": true,
+   "H2": false,
+   "H3": false,
+   "H4": true,
+   "H5": false,
+   "H6": false
+  },
+  "passa": false,
+  "por_activo": {
+   "ADA": -0.0127,
+   "APT": 0.0437,
+   "ARB": -0.0924,
+   "AVAX": 0.2204,
+   "BCH": 0.0404,
+   "BNB": -0.0622,
+   "DOGE": 0.0719,
+   "DOT": 0.1941,
+   "ETH": -0.0032,
+   "LINK": 0.0007,
+   "LTC": 0.0532,
+   "NEAR": -0.165,
+   "OP": 0.1805,
+   "SOL": -0.0998,
+   "SUI": 0.0697,
+   "TRX": -0.1261,
+   "XRP": 0.1098
+  }
+ },
+ "PRE_17": {
+  "metricas": {
+   "n": 1514.0,
+   "media": -0.0624,
+   "erro_padrao": 0.0254,
+   "mediana": -0.1509,
+   "soma": -94.4893,
+   "PF": 0.8583,
+   "taxa_acerto": 0.4531,
+   "dd_max": 144.9523,
+   "R_bruto_medio": -0.0461,
+   "duracao_h_media": 35.5555,
+   "frac_stop": 0.3838,
+   "frac_alvo": 0.0
+  },
+  "por_ano": {
+   "2020": 0.1323,
+   "2021": -0.105,
+   "2022": -0.0823
+  }
+ },
+ "PRE_5": {
+  "n": 628.0,
+  "media": -0.1748,
+  "erro_padrao": 0.0376,
+  "mediana": -0.325,
+  "soma": -109.7626,
+  "PF": 0.6443,
+  "taxa_acerto": 0.4076,
+  "dd_max": 124.7845,
+  "R_bruto_medio": -0.1581,
+  "duracao_h_media": 33.3802,
+  "frac_stop": 0.4395,
+  "frac_alvo": 0.0
+ },
+ "M": 56
+}

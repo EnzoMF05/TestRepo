@@ -1,4 +1,4 @@
-=== API (88) ===
+=== API (92) ===
 - [reversao.py] lambda_ancora(h_a: float) -> float  :: Factor da ancora exponencial a partir da meia-vida em velas de 1 h; ValueError se h_a <= 0.
     
     formula: (1) lambda_A = 2^(-1/h_A)
@@ -212,7 +212,13 @@
 - [sinalizador.py] carregar_baleias(caminho: str) -> List[str] ; construir_baleias(cfg, leaderboard: List[dict], negocios_24h: Dict[str, Tuple[float, float]], liquidados_7d: Set[str], excluidos: Set[str]) -> List[str] ; sondar_baleias(cfg, enderecos: List[str]) -> Dict[str, List[Posicao]]  :: Lista diaria com os filtros da seccao 6.5 (so prefixo e hash em ficheiro) e sonda clearinghouseState em thread com orcamento de peso (400 por minuto no maximo).
     
     formula: seccao 6.5
-- [sinalizador.py] cmd_correr(cfg) ; cmd_verificar(cfg) ; cmd_historico(cfg) ; cmd_baleias(cfg) ; cmd_relatorio(cfg) ; cmd_ensaios(cfg) ; cmd_reset(cfg) ; main(argv=None)  :: CLI com --config; verificar confere H1 a H8 e imprime OK/AVISO/FALHA; historico descarrega candleSnapshot e fundingHistory; relatorio junta registo_sinalizador.
+- [sinalizador.py] cmd_correr(cfg) ; cmd_verificar(cfg) ; cmd_historico(cfg) ; cmd_baleias(cfg) ; cmd_relatorio(cfg) ; cmd_ensaios(cfg) ; cmd_reset(cfg) ; cmd_teste3sigma(cfg) ; main(argv=None)  :: CLI com --config; verificar confere H1 a H8 e imprime OK/AVISO/FALHA; historico descarrega candleSnapshot e fundingHistory; relatorio junta registo_sinalizador.
+- [sinalizador.py] resumo_teste3(linhas, minimo=100, custo_bps=6.5) -> Dict ; cmd_teste3sigma(cfg)  :: Metricas do registo_teste_3sigma.csv em R (n, media, erro padrao, PF, acerto, DD total e por activo, metades, nula = -2 custo / R medio em bps) e veredictos H1 a H6 com H5 por activo; o comando recusa-se a mostrar metricas antes de 100 trades ("Faltam N") e com 100 imprime a avaliacao unica.
+- [sinalizador.py] ActivoSinal._teste3(vela) ; COLUNAS_TESTE3 ; ConfigSinalizador.reg_teste3  :: Corre TesteTresSigma em cada fecho de 15 m (historico e ao vivo), regista no log os sinais virtuais e escreve os trades fechados com id ATIVO-t_sinal, so quando t_sinal >= TESTE3_DESDE_MS; nunca escreve em sinais.csv; dedup por id ao rearrancar.
+- [sinalizador.py] Sinalizador._fechar com ParametrosSinalizador.emitir  :: Com emitir = nao (defeito) o sinal e avaliado e registado mas nao escrito nem notificado; log "NAO emitido (emitir = nao)"; _correr avisa no arranque.
+- [reversao.py] TESTE3_DESDE_MS = 1788998400000 ; class TesteTresSigma(meia_vida=96.0, z_lim=3.0, velas_stop=8, alvo_r=1.5, tmax_15=8, deslize_bps=5.0, custo_bps=6.5, aquecimento=384): fecho(vela: Vela) -> (trade fechado | None, sinal virtual | None); sigma: float; n, ignorados  :: Teste pre-registado 8.1 da SINTESE, so registo virtual: EWMA do log-preco e da variancia de 15 m com meia-vida 96 velas (a ancora ewma48 da pesquisa), z escalado por sqrt(lam^2/(1-lam^2)); sinal no primeiro fecho com |z| >= 3 vindo de |z| < 3, lado contra o desvio; entrada na abertura seguinte; stop = c_sinal exp(-lado sigma sqrt(8)) (abertura para la do stop: ignorado); alvo = entrada + lado 1,5 R; TradeVirtual com 8 velas e 5 bps de deslize; R = r_liq_bps / r_bps, r_liq = r_bruto - 2 x 6,5.
+    
+    formula: z = (ln c - EWMA_96(ln c)) / (sqrt(EWMA_96(r^2)) sqrt(lam^2/(1-lam^2))), lam = 2^(-1/96)
     
     formula: seccoes 3.2, 7.6, 11.5
 - [backtest_reversao.py] carregar_velas(pasta: str, ativo: str, intervalo: str) -> List[Vela] ; carregar_funding(pasta: str, ativo: str) -> Dict[int, float]  :: Le dados/velas/ e dados/funding/ (ou candleSnapshot via cmd_historico); verifica contiguidade e marca buracos.
@@ -264,7 +270,9 @@
     
     formula: seccao 14
 
-=== PARAMETROS (88) ===
+=== PARAMETROS (90) ===
+- [sinalizador] emitir = nao  :: Escrever (sim) ou nao (nao) os sinais em sinais.csv. Defeito nao: a regra foi falsificada em dados reais (pesquisa/relatorios/SINTESE.md); so se liga depois de um teste pre-registado positivo.
+- [sinalizador] teste3 = sim  :: Correr o teste pre-registado 8.1 (ressalto de 2 h depois de 3 sigma) so em registo, em dados/registo_teste_3sigma.csv.
 - [[sinalizador]] h_a = 96 | Meia-vida da ancora em velas de 1 h | h_A >= 4 H_max para que rho fique acima de 0,75 em toda a gama de H; deriva da ancora pequena durante o trade
 - [[sinalizador]] n_ajuste = 720 | Janela de partida do AR(1) em velas de 1 h | 30 dias; IC de theta com largura cerca de 35 por cento (medido em OU sintetico); abaixo o IC explode, acima mistura regi
 - [[sinalizador]] n_min = 480 | Janela minima para o ajuste ser valido | 20 dias; abaixo o teste nao tem potencia
@@ -354,7 +362,9 @@
 - [[sombra]] horizonte_regra_s = 3600 | Horizonte da regra passiva/agressiva do medidor | A regra aos 300 s mede a entrada, nao o trade
 - [[coinglass]] chave = (vazio) | Chave da API, opcional | Sem chave T4 vale 0 e liq = na; nunca em registos nem na nota
 
-=== PLANO DE TESTES (22) ===
+=== PLANO DE TESTES (24) ===
+- teste_reversao.TesteTresSigmaTeste: sem sinal antes do aquecimento e sem choque; deriva sustentada de 3 sigma da sinal virtual de compra com z <= -3, entrada na abertura seguinte, stop e alvo pelas formulas, fecho por alvo com R = (r_bruto - 13) / r_bps e velas = 2; abertura para la do stop conta em ignorados; subida sustentada da venda e saida por tempo na 8.a vela; determinismo.
+- teste_sinalizador.EmissaoDesligada: sem a chave emitir o defeito e nao (teste3 sim); com emitir = nao um sinal em _fechar nao escreve em sinais.csv e o log diz NAO emitido; teste3sigma recusa antes de 100 ("Faltam 99"); resumo com 100 trades da media, PF, nula e H1 a H6; H5 e por activo (DD 11 R por activo reprova, 9 R aprova mesmo com 27 R no total).
 - teste_reversao.AncoraEAjuste: Ancora coincide com nucleo.Ewma de meia-vida h_a; dA_t = ((1 - lambda)/lambda) d_t a 1e-12; ajustar_ar1 sobre AR(1) sintetico com phi e sigma conhecidos devolve phi_c e sigma_eq dentro de 3 erros padrao; devolve nan com N < 3 e valido = False com phi_c fora de (0, 1).
 - teste_reversao.Nula: 200 trajectorias de passeio aleatorio (simular_gbm) com N = 720 e h_a = 96 dao media de phi_c - lambda_A dentro de 0,001 e t_nulo com media em [-0,5, 0,8]; rho(phi = lambda_A) = 0 exactamente; calibrar_t_crit e determinista bit a bit (duas chamadas iguais) e devolve um valor em 
 - teste_reversao.RacioVariancias: em passeio aleatorio homoscedastico z*(8) coincide com z_simples(8) a menos de 5 por cento em 100 replicas; VR(8) perto de 1 em passeio aleatorio e abaixo de 0,7 em OU com H = 8; ValueError com q < 2.

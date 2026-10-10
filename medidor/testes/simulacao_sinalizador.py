@@ -917,6 +917,7 @@ url_ws = ws://127.0.0.1:%d
 url_info = http://127.0.0.1:%d
 url_coinglass = ws://127.0.0.1:%d/?k=
 [sinalizador]
+emitir = sim
 replicas_nula = 200
 baleias_max = 5
 sonda_s = 60

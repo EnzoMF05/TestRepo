@@ -1,0 +1,10 @@
+{
+ "escolha": null,
+ "natural": {
+  "h": 24,
+  "z": 2.0,
+  "stop_sigma": 1.5,
+  "n_max": 192,
+  "filtro": 0
+ }
+}

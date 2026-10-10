@@ -21,7 +21,7 @@ import random
 import statistics
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 import nucleo as nu
 
@@ -1243,6 +1243,103 @@ class TradeVirtual:
         if not (p_fecho > 0.0):
             raise ValueError("preco de fecho tem de ser positivo")
         return self._fechar(motivo or "invalidacao", p_fecho, t_ms)
+
+
+# --------------------------------------------------------------------------
+# Teste pre-registado (pesquisa/relatorios/SINTESE.md, 8.1): ressalto de 2 h depois de 3 sigma
+# --------------------------------------------------------------------------
+TESTE3_DESDE_MS = 1788998400000   # 2026-09-10T00:00:00Z: so dados posteriores ao OOS ja gasto
+
+
+class TesteTresSigma:
+    """Teste pre-registado 8.1 da SINTESE: NAO e uma regra de negociacao, e um registo virtual.
+
+    No fecho de cada vela de 15 m: x = ln c; A = EWMA_96(x); s = sqrt(EWMA_96(r^2)) com r o
+    retorno de 15 m; z = (x - A) / (s sqrt(lam^2 / (1 - lam^2))), lam = 2^(-1/96). A meia-vida
+    e de 96 velas de 15 m (24 h): e a ancora "ewma48" da pesquisa (janela J = 192 velas, 48 h),
+    com a sigma da mesma meia-vida e a escala do passeio aleatorio. Sinal no
+    primeiro fecho com |z| >= 3 depois de |z| < 3; lado = -sinal(z). Entrada na abertura da
+    vela seguinte, que e a 1.a das 8. Stop = c_sinal exp(-lado s sqrt(8)), preenchido no pior
+    entre o nivel com 5 bps de deslize e a abertura; R = |entrada - stop|. Alvo = entrada +
+    lado 1,5 R, no nivel; alvo e stop na mesma vela = stop. Tempo: fecho da 8.a vela. Custo
+    6,5 bps por lado. Uma posicao. Se a abertura de entrada ja passou o stop nao ha trade
+    (conta em ignorados). Avalia-se UMA vez com n >= 100. Nunca escreve sinais.
+    """
+
+    def __init__(self, meia_vida: float = 96.0, z_lim: float = 3.0, velas_stop: int = 8, alvo_r: float = 1.5,
+                 tmax_15: int = 8, deslize_bps: float = 5.0, custo_bps: float = 6.5, aquecimento: int = 384):
+        if meia_vida <= 0 or z_lim <= 0 or velas_stop < 1 or alvo_r <= 0 or tmax_15 < 1:
+            raise ValueError("parametros do teste invalidos")
+        la = nu.lam(meia_vida)
+        self.z_lim, self.velas_stop, self.alvo_r, self.tmax_15 = z_lim, velas_stop, alvo_r, tmax_15
+        self.deslize_bps, self.custo_bps, self.aquecimento = deslize_bps, custo_bps, aquecimento
+        self.anc = nu.Ewma(meia_vida)
+        self.var = nu.Ewma(meia_vida)
+        self.escala = math.sqrt(la * la / (1.0 - la * la))
+        self.x_ant = NAN
+        self.z = NAN
+        self.z_ant = NAN
+        self.n = 0
+        self.ignorados = 0
+        self.pendente: Optional[Dict[str, Any]] = None
+        self.trade: Optional[TradeVirtual] = None
+        self.info: Optional[Dict[str, Any]] = None
+
+    @property
+    def sigma(self) -> float:
+        return math.sqrt(self.var.valor) if self.var.n and self.var.valor > 0.0 else NAN
+
+    def _registo(self, saida: Saida) -> Dict[str, Any]:
+        i = self.info or {}
+        r_bps = float(i.get("r_bps", NAN))
+        r_liq = saida.r_bruto_bps - 2.0 * self.custo_bps
+        return {"t_sinal": i.get("t_ms"), "lado": i.get("lado"), "z": i.get("z"), "preco_sinal": i.get("preco"),
+                "entrada": i.get("entrada"), "stop": i.get("stop"), "alvo": i.get("alvo"), "t_saida": saida.t_ms,
+                "saida": saida.preco, "motivo": saida.motivo, "velas": saida.velas,
+                "r_bruto_bps": saida.r_bruto_bps, "r_liq_bps": r_liq, "R": r_liq / r_bps if r_bps > 0.0 else NAN}
+
+    def fecho(self, vela: Vela) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """Processa um fecho de 15 m; devolve (trade fechado ou None, sinal virtual novo ou None)."""
+        fechado = None
+        if self.trade is not None:
+            saida = self.trade.avancar(vela)
+            if saida is not None:
+                fechado = self._registo(saida)
+                self.trade, self.info = None, None
+        elif self.pendente is not None:
+            p, self.pendente = self.pendente, None
+            lado, entrada = p["lado"], vela.o
+            stop = p["preco"] * math.exp(-lado * p["sigma"] * math.sqrt(self.velas_stop))
+            if not (entrada > 0.0) or lado * (entrada - stop) <= 0.0:
+                self.ignorados += 1                   # abriu para la do stop: nao ha trade
+            else:
+                dist = abs(entrada - stop)
+                alvo = entrada + lado * self.alvo_r * dist
+                self.trade = TradeVirtual(lado, entrada, alvo, stop, self.tmax_15, self.deslize_bps)
+                self.info = dict(p, entrada=entrada, stop=stop, alvo=alvo, r_bps=BPS * dist / entrada, t_entrada=vela.t)
+                saida = self.trade.avancar(vela)      # a vela de entrada e a 1.a das 8
+                if saida is not None:
+                    fechado = self._registo(saida)
+                    self.trade, self.info = None, None
+        # a ancora e a sigma so se actualizam depois de a abertura ter sido usada
+        x = math.log(vela.c)
+        if self.x_ant == self.x_ant:
+            r = x - self.x_ant
+            self.var.juntar(r * r)
+        self.x_ant = x
+        a = self.anc.juntar(x)
+        self.n += 1
+        z = NAN
+        s = self.sigma
+        if self.n > self.aquecimento and s == s and s > 0.0:
+            z = (x - a) / (s * self.escala)
+        self.z_ant, self.z = self.z, z
+        sinal = None
+        if (z == z and self.z_ant == self.z_ant and abs(z) >= self.z_lim and abs(self.z_ant) < self.z_lim
+                and self.trade is None and self.pendente is None):
+            self.pendente = {"lado": -1 if z > 0.0 else 1, "z": z, "preco": vela.c, "t_ms": vela.T, "sigma": s}
+            sinal = dict(self.pendente)
+        return fechado, sinal
 
 
 # --------------------------------------------------------------------------

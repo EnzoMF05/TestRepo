@@ -1,0 +1,4 @@
+Registo de ensaios: um CSV por familia (<familia>.csv), uma linha por configuracao experimentada,
+inclusive as descartadas. Escrito por harness.registar_ensaio; o numero de linhas e o M do relatorio.
+Colunas: data, familia, periodo, parametros (JSON), n, media, erro_padrao, PF, taxa_acerto, dd_max,
+n_activos_positivos, por_activo (JSON: media R por activo), nota.

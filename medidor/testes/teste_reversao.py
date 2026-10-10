@@ -1374,5 +1374,114 @@ class Correccoes(unittest.TestCase):
         self.assertEqual(rv.PASSO_T_CRIT, 240)
 
 
+class TesteTresSigmaTeste(unittest.TestCase):
+    """O teste pre-registado 8.1: so registo virtual, entrada na abertura seguinte, R e custos."""
+    T0 = 1_000_000_000
+
+    def _velas(self, precos, amp=0.001):
+        out = []
+        for i, c in enumerate(precos):
+            o = precos[i - 1] if i else c
+            h, l = max(o, c) * (1 + amp), min(o, c) * (1 - amp)
+            out.append(_vela(self.T0 + i * 900_000, o, h, l, c))
+        return out
+
+    def test_sem_sinal_antes_do_aquecimento_e_sem_choque(self):
+        tv = rv.TesteTresSigma(aquecimento=50)
+        rnd = random.Random(3)
+        px = [100.0]
+        for _ in range(400):
+            px.append(px[-1] * math.exp(rnd.gauss(0.0, 0.001)))
+        sinais = [tv.fecho(v)[1] for v in self._velas(px)]
+        self.assertTrue(all(s is None for s in sinais[:50]))
+        self.assertEqual(tv.ignorados, 0)
+
+    def _deriva_ate_sinal(self, tv, px, passo=-0.001, maximo=200):
+        """Deriva sustentada ate |z| >= 3 (um salto unico inflaciona a propria sigma e nao chega a 3)."""
+        i = 0
+        while i < maximo:
+            px.append(px[-1] * math.exp(passo))
+            v = _vela(self.T0 + (len(px) - 1) * 900_000, px[-2], max(px[-2], px[-1]) * 1.0002, min(px[-2], px[-1]) * 0.9998, px[-1])
+            fechado, sinal = tv.fecho(v)
+            self.assertIsNone(fechado)
+            if sinal is not None:
+                return sinal
+            i += 1
+        self.fail("sem sinal em %d velas de deriva" % maximo)
+
+    def _aquecido(self):
+        tv = rv.TesteTresSigma(aquecimento=50)
+        px = [100.0 * (1 + 0.0004 * ((i % 2) * 2 - 1)) for i in range(300)]   # ruido pequeno e regular
+        for v in self._velas(px, amp=0.0002):
+            tv.fecho(v)
+        return tv, px
+
+    def test_deriva_de_3_sigma_da_sinal_virtual_e_o_trade_segue_as_regras(self):
+        tv, px = self._aquecido()
+        sinal = self._deriva_ate_sinal(tv, px)
+        self.assertEqual(sinal["lado"], 1)                      # queda sustentada: compra
+        self.assertLessEqual(sinal["z"], -3.0)
+        self.assertAlmostEqual(sinal["preco"], px[-1])
+        k = len(px)
+        o = px[-1] * 1.0001                                     # vela seguinte: entrada na abertura
+        fechado, sinal2 = tv.fecho(_vela(self.T0 + k * 900_000, o, o * 1.0005, o * 0.9995, o * 1.0002))
+        self.assertIsNone(fechado)
+        self.assertIsNone(sinal2)
+        self.assertIsNotNone(tv.trade)
+        info = tv.info
+        self.assertAlmostEqual(info["entrada"], o)
+        self.assertAlmostEqual(info["stop"], sinal["preco"] * math.exp(-1 * sinal["sigma"] * math.sqrt(8)))
+        dist = o - info["stop"]
+        self.assertGreater(dist, 0)
+        self.assertAlmostEqual(info["alvo"], o + 1.5 * dist)
+        alvo = info["alvo"]                                     # alvo tocado na 2.a vela do trade
+        fechado, _ = tv.fecho(_vela(self.T0 + (k + 1) * 900_000, o, alvo * 1.001, o * 0.999, alvo))
+        self.assertIsNotNone(fechado)
+        self.assertEqual(fechado["motivo"], "alvo")
+        self.assertEqual(fechado["velas"], 2)
+        r_bps = 1e4 * dist / o
+        self.assertAlmostEqual(fechado["R"], (1e4 * math.log(alvo / o) - 13.0) / r_bps, places=6)
+        self.assertIsNone(tv.trade)
+        self.assertEqual(fechado["t_sinal"], sinal["t_ms"])
+
+    def test_abertura_para_la_do_stop_nao_abre_trade(self):
+        tv, px = self._aquecido()
+        sinal = self._deriva_ate_sinal(tv, px)
+        k = len(px)
+        o = sinal["preco"] * math.exp(-2 * sinal["sigma"] * math.sqrt(8))   # abre para la do stop
+        fechado, _ = tv.fecho(_vela(self.T0 + k * 900_000, o, o * 1.0005, o * 0.9995, o))
+        self.assertIsNone(fechado)
+        self.assertIsNone(tv.trade)
+        self.assertEqual(tv.ignorados, 1)
+
+    def test_subida_sustentada_da_venda_e_stop_por_tempo_na_8a_vela(self):
+        tv, px = self._aquecido()
+        sinal = self._deriva_ate_sinal(tv, px, passo=+0.001)
+        self.assertEqual(sinal["lado"], -1)
+        k = len(px)
+        o = px[-1]
+        fechados = []
+        for j in range(8):                                      # 8 velas quase paradas: sai por tempo na 8.a
+            f, _ = tv.fecho(_vela(self.T0 + (k + j) * 900_000, o, o * 1.0001, o * 0.9999, o))
+            fechados.append(f)
+        self.assertTrue(all(f is None for f in fechados[:7]))
+        self.assertEqual(fechados[7]["motivo"], "tempo")
+        self.assertEqual(fechados[7]["velas"], 8)
+
+    def test_determinismo(self):
+        rnd = random.Random(11)
+        px = [100.0]
+        for _ in range(600):
+            px.append(px[-1] * math.exp(rnd.gauss(0.0, 0.003)))
+        res = []
+        for _ in range(2):
+            tv = rv.TesteTresSigma(aquecimento=50)
+            res.append([(f["motivo"], round(f["R"], 9)) for v in self._velas(px, amp=0.002) for f in [tv.fecho(v)[0]] if f])
+        self.assertEqual(res[0], res[1])
+
+
+# ==========================================================================
+# Correccoes da revisao (um teste por achado corrigido em reversao.py)
+# ==========================================================================
 if __name__ == "__main__":
     unittest.main(verbosity=1)

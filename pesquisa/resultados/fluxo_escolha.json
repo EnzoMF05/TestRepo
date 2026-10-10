@@ -1,0 +1,10 @@
+{
+ "escolha": null,
+ "regra_natural": {
+  "regra": "div",
+  "limiar": 16,
+  "stop_atr": 1.5,
+  "alvo_atr": 3.0
+ },
+ "n_patamar": 0
+}
