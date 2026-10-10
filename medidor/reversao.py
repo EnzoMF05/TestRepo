@@ -1156,9 +1156,11 @@ class TradeVirtual:
     """Seccao 7.5 e (77): trade virtual avancado a cada fecho de 15 m.
 
     Ordem no fecho: stop se a minima/maxima (ou o mark) toca P_stop, preenchido no nivel
-    com deslize imp_bps contra; senao alvo se o fecho passa P_alvo, preenchido em P_alvo
-    (ordem passiva no nivel); senao tempo ao fecho da vela tmax_15. f_hora e o funding
-    cobrado nesta vela (0 quando nenhuma hora inteira fechou dentro do trade).
+    com deslize imp_bps contra OU na abertura da vela se ela ja abriu para la do stop (o
+    pior dos dois: num salto o stop nao preenche ao nivel); senao alvo se o fecho passa
+    P_alvo, preenchido em P_alvo (ordem passiva no nivel); senao tempo ao fecho da vela
+    tmax_15. f_hora e o funding cobrado nesta vela (0 quando nenhuma hora inteira fechou
+    dentro do trade).
     """
 
     def __init__(self, lado: int, p_entrada: float, p_alvo: float, p_stop: float, tmax_15: int, imp_bps: float):
@@ -1224,7 +1226,11 @@ class TradeVirtual:
         self._mfe = max(self._mfe, favoravel)
         self._mae = max(self._mae, adverso)
         if tocou_stop:
-            return self._fechar("stop", self.p_stop * (1.0 - self.lado * self.imp_bps / BPS), vela.T)
+            p_nivel = self.p_stop * (1.0 - self.lado * self.imp_bps / BPS)
+            # salto por cima do stop: a ordem preenche na abertura, nao no nivel
+            if vela.o > 0.0 and self.lado * (self.p_stop - vela.o) > 0.0:
+                p_nivel = vela.o
+            return self._fechar("stop", p_nivel, vela.T)
         if passou_alvo:
             return self._fechar("alvo", self.p_alvo, vela.T)
         if self.velas >= self.tmax_15:

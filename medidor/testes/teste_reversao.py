@@ -617,6 +617,19 @@ class TradeVirtualTeste(unittest.TestCase):
         self.assertEqual(s.motivo, "alvo")
         self.assertGreaterEqual(_attr(s, "preco_saida", "p_saida", "preco"), 101.0)
 
+    def test_salto_por_cima_do_stop_preenche_na_abertura(self):
+        tv = self._novo()                                                       # compra, stop 98,9
+        s = self._avancar(tv, 0, 98.0, 98.4, 97.5, 98.2)                        # abre ja abaixo do stop
+        self.assertEqual(s.motivo, "stop")
+        self.assertAlmostEqual(_attr(s, "preco_saida", "p_saida", "preco"), 98.0)   # abertura, nao 98,9
+        tv = self._novo(lado=-1)                                                # venda, stop 101,1
+        s = self._avancar(tv, 0, 102.0, 102.5, 101.6, 102.1)
+        self.assertEqual(s.motivo, "stop")
+        self.assertAlmostEqual(_attr(s, "preco_saida", "p_saida", "preco"), 102.0)
+        tv = self._novo()                                                       # sem salto: nivel com deslize
+        s = self._avancar(tv, 0, 99.5, 99.8, 98.5, 99.5)
+        self.assertAlmostEqual(_attr(s, "preco_saida", "p_saida", "preco"), 98.9 * (1 - 2.0 / 1e4))
+
     def test_stop_quando_a_minima_toca(self):
         tv = self._novo()
         self.assertIsNone(self._avancar(tv, 0, 100.0, 100.3, 99.2, 99.5))

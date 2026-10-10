@@ -423,7 +423,7 @@ Rajadas novas, TWAP contra e FUEL durante o trade **não** fecham a posição (s
 
 ### 7.5 Trade virtual e registo próprio
 
-O sinalizador mantém um trade virtual por activo em `dados/registo_sinalizador.csv` (`id, hora, ativo, lado, preco, A_0, sigma_0, phi_0, H_0, G, L, tmax_15, fase, f_B, hora_saida, preco_saida, motivo em {alvo, stop, tempo, invalidacao}, velas, mae_bps, mfe_bps, r_bruto_bps, funding_bps, r_liq_bps, nota`), avançado a cada fecho de 15 m: alvo se o **fecho** passa `P_alvo = exp(A_0 - lado z_out sigma_0)`; stop se a mínima/máxima (ou o mark) toca `P_stop`, preenchido ao nível do stop com deslize de `imp_bps`; se alvo e stop na mesma vela, conta o stop. As saídas nunca vão para `sinais.csv`: o medidor contá-las-ia como entradas do lado contrário.
+O sinalizador mantém um trade virtual por activo em `dados/registo_sinalizador.csv` (`id, hora, ativo, lado, preco, A_0, sigma_0, phi_0, H_0, G, L, tmax_15, fase, f_B, hora_saida, preco_saida, motivo em {alvo, stop, tempo, invalidacao}, velas, mae_bps, mfe_bps, r_bruto_bps, funding_bps, r_liq_bps, nota`), avançado a cada fecho de 15 m: alvo se o **fecho** passa `P_alvo = exp(A_0 - lado z_out sigma_0)`; stop se a mínima/máxima (ou o mark) toca `P_stop`, preenchido ao nível do stop com deslize de `imp_bps`, ou na abertura da vela se ela já abriu para lá do stop (o pior dos dois); se alvo e stop na mesma vela, conta o stop. As saídas nunca vão para `sinais.csv`: o medidor contá-las-ia como entradas do lado contrário.
 
 ### 7.6 Disjuntores (param a emissão; nunca fecham posições; o trade virtual continua)
 
